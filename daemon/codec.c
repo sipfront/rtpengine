@@ -58,7 +58,7 @@ static void codec_store_add_raw_order(struct codec_store *cs, rtp_payload_type *
 static rtp_payload_type *codec_store_find_compatible(struct codec_store *cs,
 		const rtp_payload_type *pt);
 static void __rtp_payload_type_add_name(codec_names_ht, rtp_payload_type *pt);
-static void codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq);
+static uint32_t codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq);
 static void __codec_options_set(call_t *call, rtp_payload_type *pt, str_case_value_ht codec_set);
 
 
@@ -2192,7 +2192,12 @@ static int handler_func_passthrough(struct codec_handler *h, struct media_packet
 	if (mp->rtp) {
 		ts = ntohl(mp->rtp->timestamp);
 		codec_calc_jitter(mp->ssrc_in, ts, h->source_pt.clock_rate, mp->tv);
-		codec_calc_lost(mp->ssrc_in, ntohs(mp->rtp->seq_num));
+		uint32_t lost_diff = codec_calc_lost(mp->ssrc_in, ntohs(mp->rtp->seq_num));
+		if (lost_diff) {
+			if (mp->sfd && mp->sfd->local_intf && mp->sfd->local_intf->stats)
+				atomic64_add_na(&mp->sfd->local_intf->stats->s.packets_lost, lost_diff);
+			RTPE_STATS_ADD(packets_lost, lost_diff);
+		}
 
 		if (ML_ISSET(mp->media->monologue, BLOCK_SHORT) && h->source_pt.codec_def
 				&& h->source_pt.codec_def->fixed_sizes)
@@ -2402,7 +2407,16 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 			goto next;
 		}
 
+		// `seq->lost_count` is a cumulative counter. Mirror its delta into global/interface counters
+		// so that interface-level loss metrics are also available in userspace-only operation.
+		uint32_t prev_lost = ssrc_in->packets_lost;
 		ssrc_in->packets_lost = seq->lost_count;
+		if (seq->lost_count > prev_lost) {
+			uint32_t diff_lost = seq->lost_count - prev_lost;
+			if (mp->sfd && mp->sfd->local_intf && mp->sfd->local_intf->stats)
+				atomic64_add_na(&mp->sfd->local_intf->stats->s.packets_lost, diff_lost);
+			RTPE_STATS_ADD(packets_lost, diff_lost);
+		}
 		atomic_set_na(&ssrc_in->stats->ext_seq, seq->ext_seq);
 
 		ilogs(transcoding, LOG_DEBUG, "Processing RTP packet: seq %u, TS %lu",
@@ -3046,7 +3060,12 @@ static int handler_func_passthrough_ssrc(struct codec_handler *h, struct media_p
 
 	uint32_t ts = ntohl(mp->rtp->timestamp);
 	codec_calc_jitter(mp->ssrc_in, ts, h->source_pt.clock_rate, mp->tv);
-	codec_calc_lost(mp->ssrc_in, ntohs(mp->rtp->seq_num));
+	uint32_t lost_diff = codec_calc_lost(mp->ssrc_in, ntohs(mp->rtp->seq_num));
+	if (lost_diff) {
+		if (mp->sfd && mp->sfd->local_intf && mp->sfd->local_intf->stats)
+			atomic64_add_na(&mp->sfd->local_intf->stats->s.packets_lost, lost_diff);
+		RTPE_STATS_ADD(packets_lost, lost_diff);
+	}
 
 	// save original payload in case DTMF mangles it
 	str orig_raw = mp->raw;
@@ -4959,8 +4978,9 @@ void codec_calc_jitter(struct ssrc_entry_call *ssrc, unsigned long ts, unsigned 
 	if (d < 100000)
 		ssrc->jitter += d - ((ssrc->jitter + 8) >> 4);
 }
-static void codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq) {
+static uint32_t codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq) {
 	LOCK(&ssrc->h.lock);
+	uint32_t before_lost = ssrc->packets_lost;
 
 	// XXX shared code from kernel module
 
@@ -5010,6 +5030,8 @@ static void codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq) {
 	seq_diff = (new_seq & 0xffff) - seq;
 	if (seq_diff < (sizeof(ssrc->lost_bits) * 8))
 		ssrc->lost_bits |= (1 << seq_diff);
+
+	return ssrc->packets_lost - before_lost;
 }
 
 
