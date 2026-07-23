@@ -511,6 +511,9 @@ static void mqtt_full_call(call_t *call, JsonBuilder *json) {
 
 
 static void mqtt_global_stats(JsonBuilder *json) {
+	json_builder_set_member_name(json, "local_jitter_enabled");
+	json_builder_add_boolean_value(json, rtpe_config.measure_rtp ? TRUE : FALSE);
+
 	g_autoptr(stats_metric_q) metrics = statistics_gather_metrics(&interface_rate_stats);
 
 	for (__auto_type l = metrics->head; l; l = l->next) {
