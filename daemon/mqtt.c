@@ -566,6 +566,14 @@ INLINE JsonBuilder *__mqtt_timer_intro(void) {
 	json_builder_set_member_name(json, "timestamp");
 	json_builder_add_double_value(json, (double) rtpe_now / 1000000.);
 
+	json_builder_set_member_name(json, "producer");
+	json_builder_begin_object(json);
+	json_builder_set_member_name(json, "name");
+	json_builder_add_string_value(json, "rtpengine");
+	json_builder_set_member_name(json, "version");
+	json_builder_add_string_value(json, RTPENGINE_VERSION);
+	json_builder_end_object(json);
+
 	return json;
 }
 INLINE void __mqtt_timer_outro(JsonBuilder *json) {
