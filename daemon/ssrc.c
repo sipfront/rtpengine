@@ -424,6 +424,20 @@ void ssrc_sender_report(struct call_media *m, const struct ssrc_sender_report *s
 	mutex_unlock(&e->lock);
 	obj_put(e);
 }
+
+/**
+ * Processes an RTCP receiver report and updates the corresponding SSRC statistics.
+ *
+ * Interval jitter is sampled only while the call is active. A call retained during
+ * its delete delay can still receive late RTCP packets, but those packets must not
+ * make the interval jitter appear active after the call has ended.
+ *
+ * @param m Call media associated with the receiver report.
+ * @param sfd Stream file descriptor used to attribute interface statistics.
+ * @param rr Parsed RTCP receiver report to process.
+ * @param tv Report reception timestamp in microseconds.
+ * @return No value.
+ */
 void ssrc_receiver_report(struct call_media *m, stream_fd *sfd, const struct ssrc_receiver_report *rr,
 		int64_t tv)
 {
@@ -475,7 +489,8 @@ void ssrc_receiver_report(struct call_media *m, stream_fd *sfd, const struct ssr
 		.packetloss = (unsigned int) rr->fraction_lost * 100 / 256,
 	};
 
-	RTPE_SAMPLE_SFD(jitter, jitter, sfd);
+	if (!m->call->deleted_us)
+		RTPE_SAMPLE_SFD(jitter, jitter, sfd);
 	RTPE_SAMPLE_SFD(rtt_e2e, rtt_end2end, sfd);
 	RTPE_SAMPLE_SFD(rtt_dsct, rtt, sfd);
 	RTPE_SAMPLE_SFD(packetloss, ssb->packetloss, sfd);
@@ -702,8 +717,19 @@ out:
 }
 
 
-// call master lock held in R
+/**
+ * Collects locally measured RTP jitter for the current statistics interval.
+ *
+ * The call master lock must be held for reading. Calls retained during their
+ * delete delay are ignored so their last measured jitter is not sampled again.
+ *
+ * @param media Call media whose ingress SSRC jitter values are sampled.
+ * @return No value.
+ */
 void ssrc_collect_metrics(struct call_media *media) {
+	if (media->call->deleted_us)
+		return;
+
 	for (GList *l = media->ssrc_hash_in.nq.head; l; l = l->next) {
 		struct ssrc_entry_call *s = l->data;
 		if (!s)
