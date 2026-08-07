@@ -156,6 +156,17 @@ extern struct global_sampled_min_max rtpe_sampled_min_max;		// master lifetime m
 		} \
 	} while (0)
 
+// Add a sample to one directional interface accumulator without changing legacy metrics.
+#define RTPE_SAMPLE_SFD_DIR(field, num, sfd, direction) \
+	do { \
+		if (sfd) { \
+			struct local_intf *__intf = sfd->local_intf; \
+			atomic64_add_na(&__intf->stats->sampled_ ## direction.sums.field, num); \
+			atomic64_add_na(&__intf->stats->sampled_ ## direction.sums_squared.field, num * num); \
+			atomic64_inc_na(&__intf->stats->sampled_ ## direction.counts.field); \
+		} \
+	} while (0)
+
 extern struct global_stats_counter *rtpe_stats;			// total, cumulative, master
 extern struct global_stats_counter rtpe_stats_rate;		// per-second, calculated once per timer run
 extern struct global_stats_counter rtpe_stats_intv;		// per-second, calculated once per timer run
