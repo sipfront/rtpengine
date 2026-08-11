@@ -43,6 +43,9 @@ struct interface_stats_block {
 						out;
 	struct interface_counter_stats		s;
 	struct interface_sampled_stats		sampled;
+	struct interface_sampled_stats		sampled_in,
+							sampled_out;
+	atomic64				packets_lost_egress;
 };
 
 struct stream_stats {

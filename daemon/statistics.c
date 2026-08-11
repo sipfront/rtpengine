@@ -312,7 +312,14 @@ static void add_header(stats_metric_q *ret, const char *fmt1, const char *fmt2, 
 #define HEADER(fmt1, fmt2, ...) add_header(ret, fmt1, fmt2, ##__VA_ARGS__)
 #define HEADERl(fmt2, ...) add_header(ret, NULL, fmt2, ##__VA_ARGS__)
 
-
+/**
+ * Gathers the current global and per-interface statistics for all configured outputs.
+ *
+ * @param interface_rate_stats Previous per-interface snapshots used to calculate
+ * interval and rate values, or NULL when those values are not requested.
+ * @return A newly allocated metric queue that must be released with
+ * statistics_free_metrics().
+ */
 stats_metric_q *statistics_gather_metrics(struct interface_sampled_rate_stats *interface_rate_stats) {
 	stats_metric_q *ret = stats_metric_q_new();
 
@@ -699,15 +706,21 @@ stats_metric_q *statistics_gather_metrics(struct interface_sampled_rate_stats *i
 		int64_t time_diff_us;
 		struct interface_stats_block *intv_stats
 			= interface_sampled_rate_stats_get(interface_rate_stats, lif, &time_diff_us);
+		struct interface_counter_stats counter_diff = {0};
+		struct interface_sampled_stats diff_in_sampled = {0};
+		struct interface_sampled_stats diff_out_sampled = {0};
 
 		if (intv_stats) {
 			HEADER("interval", NULL);
 			HEADER("{", NULL);
 
-			struct interface_counter_stats diff;
-			interface_counter_calc_diff(&lif->stats->s, &intv_stats->s, &diff);
+			interface_counter_calc_diff(&lif->stats->s, &intv_stats->s, &counter_diff);
+			interface_sampled_calc_diff(&lif->stats->sampled_in,
+					&intv_stats->sampled_in, &diff_in_sampled);
+			interface_sampled_calc_diff(&lif->stats->sampled_out,
+					&intv_stats->sampled_out, &diff_out_sampled);
 
-#define F(f) METRICs(#f, "%" PRIu64, atomic64_get_na(&diff.f));
+#define F(f) METRICs(#f, "%" PRIu64, atomic64_get_na(&counter_diff.f));
 #include "interface_counter_stats_fields.inc"
 #undef F
 
@@ -718,7 +731,7 @@ stats_metric_q *statistics_gather_metrics(struct interface_sampled_rate_stats *i
 				HEADER("{", NULL);
 
 				struct interface_counter_stats rate;
-				interface_counter_calc_rate_from_diff(time_diff_us, &diff, &rate);
+				interface_counter_calc_rate_from_diff(time_diff_us, &counter_diff, &rate);
 
 #define F(f) METRICs(#f, "%" PRIu64, atomic64_get_na(&rate.f));
 #include "interface_counter_stats_fields.inc"
@@ -805,6 +818,13 @@ stats_metric_q *statistics_gather_metrics(struct interface_sampled_rate_stats *i
 				sockaddr_print_buf(&lif->spec->local_address.addr));
 #include "interface_counter_stats_fields_dir.inc"
 #undef F
+		METRICs("packets_lost", "%" PRIu64,
+				atomic64_get_na(&lif->stats->s.packets_lost));
+		METRICs("jitter_average_ms", "%.6f",
+				atomic64_div(&lif->stats->sampled_in.sums.jitter_measured,
+					&lif->stats->sampled_in.counts.jitter_measured));
+		METRICs("jitter_samples", "%" PRIu64,
+				atomic64_get_na(&lif->stats->sampled_in.counts.jitter_measured));
 		HEADER("}", NULL);
 
 		HEADER("egress", NULL);
@@ -816,6 +836,18 @@ stats_metric_q *statistics_gather_metrics(struct interface_sampled_rate_stats *i
 				sockaddr_print_buf(&lif->spec->local_address.addr));
 #include "interface_counter_stats_fields_dir.inc"
 #undef F
+		METRICs("packets_lost", "%" PRIu64,
+				atomic64_get_na(&lif->stats->packets_lost_egress));
+		METRICs("jitter_average_ms", "%.6f",
+				atomic64_div(&lif->stats->sampled_out.sums.jitter,
+					&lif->stats->sampled_out.counts.jitter));
+		METRICs("jitter_samples", "%" PRIu64,
+				atomic64_get_na(&lif->stats->sampled_out.counts.jitter));
+		METRICs("rtt_average_ms", "%.6f",
+				atomic64_div(&lif->stats->sampled_out.sums.rtt_dsct,
+					&lif->stats->sampled_out.counts.rtt_dsct) / 1000.0);
+		METRICs("rtt_samples", "%" PRIu64,
+				atomic64_get_na(&lif->stats->sampled_out.counts.rtt_dsct));
 		HEADER("}", NULL);
 
 		if (intv_stats) {
@@ -854,6 +886,16 @@ stats_metric_q *statistics_gather_metrics(struct interface_sampled_rate_stats *i
 #define F(f) METRICs(#f, "%" PRIu64, atomic64_get_na(&rate.f));
 #include "interface_counter_stats_fields_dir.inc"
 #undef F
+				atomic64 packets_lost_rate;
+				atomic64_calc_rate_from_diff(time_diff_us,
+						atomic64_get_na(&counter_diff.packets_lost), &packets_lost_rate);
+				METRICs("packets_lost", "%" PRIu64,
+						atomic64_get_na(&packets_lost_rate));
+				METRICs("jitter_ms", "%.6f",
+						atomic64_div(&diff_in_sampled.sums.jitter_measured,
+							&diff_in_sampled.counts.jitter_measured));
+				METRICs("jitter_samples", "%" PRIu64,
+						atomic64_get_na(&diff_in_sampled.counts.jitter_measured));
 
 				HEADER("}", NULL);
 
@@ -866,6 +908,22 @@ stats_metric_q *statistics_gather_metrics(struct interface_sampled_rate_stats *i
 #define F(f) METRICs(#f, "%" PRIu64, atomic64_get_na(&rate.f));
 #include "interface_counter_stats_fields_dir.inc"
 #undef F
+				// Each RTCP loss sample is a per-SSRC rate; sum them for the interface rate.
+				METRICs("packets_lost", "%.6f",
+						(double) atomic64_get_na(
+							&diff_out_sampled.sums.packets_lost_rate_milli) / 1000.0);
+				METRICs("packets_lost_samples", "%" PRIu64,
+						atomic64_get_na(&diff_out_sampled.counts.packets_lost_rate_milli));
+				METRICs("jitter_ms", "%.6f",
+						atomic64_div(&diff_out_sampled.sums.jitter,
+							&diff_out_sampled.counts.jitter));
+				METRICs("jitter_samples", "%" PRIu64,
+						atomic64_get_na(&diff_out_sampled.counts.jitter));
+				METRICs("rtt_ms", "%.6f",
+						atomic64_div(&diff_out_sampled.sums.rtt_dsct,
+							&diff_out_sampled.counts.rtt_dsct) / 1000.0);
+				METRICs("rtt_samples", "%" PRIu64,
+						atomic64_get_na(&diff_out_sampled.counts.rtt_dsct));
 
 				HEADER("}", NULL);
 			}

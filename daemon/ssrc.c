@@ -426,11 +426,14 @@ void ssrc_sender_report(struct call_media *m, const struct ssrc_sender_report *s
 }
 
 /**
- * Processes an RTCP receiver report and updates the corresponding SSRC statistics.
+ * Processes an RTCP receiver report and updates the corresponding SSRC and
+ * directional interface statistics.
  *
- * Interval jitter is sampled only while the call is active. A call retained during
- * its delete delay can still receive late RTCP packets, but those packets must not
- * make the interval jitter appear active after the call has ended.
+ * Jitter, RTT, and packet-loss samples are attributed to the egress direction because
+ * a receiver report describes RTP sent from rtpengine to the reporting peer.
+ * Directional samples are collected only while the call is active. A call retained
+ * during its delete delay can still receive late RTCP packets, but those packets must
+ * not change the cumulative or current-interval directional metrics.
  *
  * @param m Call media associated with the receiver report.
  * @param sfd Stream file descriptor used to attribute interface statistics.
@@ -445,34 +448,79 @@ void ssrc_receiver_report(struct call_media *m, stream_fd *sfd, const struct ssr
 			FMT_M(rr->from), FMT_M(rr->ssrc), rr->fraction_lost, rr->packets_lost,
 			rr->high_seq_received, rr->jitter, rr->lsr, rr->dlsr);
 
-	int pt;
+	struct ssrc_entry_call *reported_e = find_ssrc(rr->ssrc, &m->ssrc_hash_out, NULL);
+	if (G_UNLIKELY(!reported_e)) {
+		ilog(LOG_DEBUG, "No outbound SSRC found for RTCP RR, discarding");
+		return;
+	}
+
+	mutex_lock(&reported_e->tracker.lock);
+	int pt = reported_e->tracker.most[0] == 255 ? -1 : reported_e->tracker.most[0];
+	mutex_unlock(&reported_e->tracker.lock);
+
+	if (!m->call->deleted_us) {
+		uint32_t raw_packets_lost = rr->packets_lost & 0x00ffffff;
+		int32_t packets_lost = raw_packets_lost & 0x00800000
+			? (int32_t) (raw_packets_lost | 0xff000000)
+			: (int32_t) raw_packets_lost;
+		int64_t report_interval_us = 0;
+		int64_t packets_lost_delta = 0;
+
+		mutex_lock(&reported_e->h.lock);
+		if (reported_e->directional_packets_lost_rtcp_valid) {
+			report_interval_us = tv - reported_e->directional_packets_lost_rtcp_reported_us;
+			packets_lost_delta = packets_lost - reported_e->directional_packets_lost_rtcp;
+		}
+		else if (packets_lost > 0)
+			packets_lost_delta = packets_lost;
+		reported_e->directional_packets_lost_rtcp = packets_lost;
+		reported_e->directional_packets_lost_rtcp_reported_us = tv;
+		reported_e->directional_packets_lost_rtcp_valid = true;
+		mutex_unlock(&reported_e->h.lock);
+
+		if (packets_lost_delta > 0 && sfd)
+			atomic64_add_na(&sfd->local_intf->stats->packets_lost_egress,
+					packets_lost_delta);
+
+		if (report_interval_us > 0) {
+			uint64_t packets_lost_rate_milli = packets_lost_delta > 0
+				? (uint64_t) packets_lost_delta * 1000000000ULL / report_interval_us
+				: 0;
+			RTPE_SAMPLE_SFD_DIR(packets_lost_rate_milli, packets_lost_rate_milli,
+					sfd, out);
+		}
+	}
 
 	int64_t rtt = calc_rtt(m,
 			.ht = &m->ssrc_hash_out,
 			.tv = tv,
-			.pt_p = &pt,
 			.ssrc = rr->ssrc,
 			.ntp_middle_bits = rr->lsr,
 			.delay = rr->dlsr,
 			.reports_queue_offset = G_STRUCT_OFFSET(struct ssrc_entry_call, sender_reports));
-
-	struct ssrc_entry_call *other_e = get_ssrc(rr->from, &m->ssrc_hash_in);
-	if (G_UNLIKELY(!other_e))
-		goto out_nl;
+	if (!m->call->deleted_us && rtt > 0)
+		RTPE_SAMPLE_SFD_DIR(rtt_dsct, rtt, sfd, out);
+	obj_put(&reported_e->h);
 
 	// determine the clock rate for jitter values
 	if (pt < 0) {
 		ilog(LOG_DEBUG, "No payload type known for RTCP RR, discarding");
-		goto out_nl_put;
+		return;
 	}
 
 	const rtp_payload_type *rpt = get_rtp_payload_type(pt, &m->codecs);
 	if (!rpt) {
 		ilog(LOG_INFO, "Invalid RTP payload type %i, discarding RTCP RR", pt);
-		goto out_nl_put;
+		return;
 	}
 	unsigned int jitter = rpt->clock_rate ? (rr->jitter * 1000 / rpt->clock_rate) : rr->jitter;
 	ilog(LOG_DEBUG, "Calculated jitter for %s%x%s is %u ms", FMT_M(rr->ssrc), jitter);
+	if (!m->call->deleted_us && rpt->clock_rate)
+		RTPE_SAMPLE_SFD_DIR(jitter, jitter, sfd, out);
+
+	struct ssrc_entry_call *other_e = get_ssrc(rr->from, &m->ssrc_hash_in);
+	if (G_UNLIKELY(!other_e))
+		goto out_nl;
 
 	ilog(LOG_DEBUG, "Adding opposide side RTT of %u us", other_e->last_rtt);
 
@@ -718,10 +766,13 @@ out:
 
 
 /**
- * Collects locally measured RTP jitter for the current statistics interval.
+ * Collects locally measured RTP jitter for cumulative and current-interval
+ * interface statistics.
  *
  * The call master lock must be held for reading. Calls retained during their
  * delete delay are ignored so their last measured jitter is not sampled again.
+ * Directional samples are emitted only when the negotiated clock rate is known,
+ * ensuring that values published with millisecond field names are correctly scaled.
  *
  * @param media Call media whose ingress SSRC jitter values are sampled.
  * @return No value.
@@ -739,17 +790,23 @@ void ssrc_collect_metrics(struct call_media *media) {
 		if (!s->jitter)
 			continue;
 		uint32_t jitter = s->jitter >> 4;
+		bool jitter_in_ms = false;
 
 		if (s->tracker.most_len > 0 && s->tracker.most[0] != 255) {
 			const rtp_payload_type *rpt = get_rtp_payload_type(s->tracker.most[0],
 					&media->codecs);
-			if (rpt && rpt->clock_rate)
+			if (rpt && rpt->clock_rate) {
 				jitter = (uint64_t) jitter * 1000 / rpt->clock_rate;
+				jitter_in_ms = true;
+			}
 		}
 
 		if (media->streams.head) {
 			LOCK(&media->streams.head->data->lock);
 			RTPE_SAMPLE_SFD(jitter_measured, jitter, media->streams.head->data->selected_sfd);
+			if (jitter_in_ms)
+				RTPE_SAMPLE_SFD_DIR(jitter_measured, jitter,
+						media->streams.head->data->selected_sfd, in);
 		}
 	}
 }
