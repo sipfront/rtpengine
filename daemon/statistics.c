@@ -783,6 +783,8 @@ stats_metric_q *statistics_gather_metrics(struct interface_sampled_rate_stats *i
 
 			METRIC("mos", "Average interval MOS", "%.6f", "%.6f", \
 					(double) atomic64_get_na(&avg.avg.mos) / 10.0); \
+			METRIC("mos_samples", "Number of MOS samples in interval", "%" PRIu64, "%" PRIu64, \
+					atomic64_get_na(&diff.counts.mos)); \
 			METRIC("mos_stddev", "Standard deviation interval MOS", "%.6f", "%.6f", \
 					(double) atomic64_get_na(&avg.stddev.mos) / 100.0); \
 			METRIC("jitter", "Average interval jitter (reported)", "%.6f", "%.6f", \
