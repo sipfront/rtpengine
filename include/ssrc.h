@@ -100,6 +100,7 @@ struct ssrc_entry_call {
 	int64_t directional_packets_lost_rtcp_reported_us; // timestamp of the last directional loss sample
 	bool directional_packets_lost_rtcp_valid; // whether a directional RTCP loss baseline is available
 	uint32_t duplicates;
+	atomic64 jitter_measured_sample_packets; // RTP packet count used for the last local jitter sample
 
 	// for transcoding
 	// input only

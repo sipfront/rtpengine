@@ -431,9 +431,9 @@ void ssrc_sender_report(struct call_media *m, const struct ssrc_sender_report *s
  *
  * Jitter, RTT, and packet-loss samples are attributed to the egress direction because
  * a receiver report describes RTP sent from rtpengine to the reporting peer.
- * Directional samples are collected only while the call is active. A call retained
- * during its delete delay can still receive late RTCP packets, but those packets must
- * not change the cumulative or current-interval directional metrics.
+ * Every receiver report provides fresh RTCP measurements. Sampling is therefore based
+ * on report arrival rather than the call deletion state, which may be set by signaling
+ * while media is still active.
  *
  * @param m Call media associated with the receiver report.
  * @param sfd Stream file descriptor used to attribute interface statistics.
@@ -458,7 +458,8 @@ void ssrc_receiver_report(struct call_media *m, stream_fd *sfd, const struct ssr
 	int pt = reported_e->tracker.most[0] == 255 ? -1 : reported_e->tracker.most[0];
 	mutex_unlock(&reported_e->tracker.lock);
 
-	if (!m->call->deleted_us) {
+	// A received RTCP report is itself the freshness signal for packet-loss metrics.
+	{
 		uint32_t raw_packets_lost = rr->packets_lost & 0x00ffffff;
 		int32_t packets_lost = raw_packets_lost & 0x00800000
 			? (int32_t) (raw_packets_lost | 0xff000000)
@@ -498,7 +499,7 @@ void ssrc_receiver_report(struct call_media *m, stream_fd *sfd, const struct ssr
 			.ntp_middle_bits = rr->lsr,
 			.delay = rr->dlsr,
 			.reports_queue_offset = G_STRUCT_OFFSET(struct ssrc_entry_call, sender_reports));
-	if (!m->call->deleted_us && rtt > 0)
+	if (rtt > 0)
 		RTPE_SAMPLE_SFD_DIR(rtt_dsct, rtt, sfd, out);
 	obj_put(&reported_e->h);
 
@@ -515,7 +516,7 @@ void ssrc_receiver_report(struct call_media *m, stream_fd *sfd, const struct ssr
 	}
 	unsigned int jitter = rpt->clock_rate ? (rr->jitter * 1000 / rpt->clock_rate) : rr->jitter;
 	ilog(LOG_DEBUG, "Calculated jitter for %s%x%s is %u ms", FMT_M(rr->ssrc), jitter);
-	if (!m->call->deleted_us && rpt->clock_rate)
+	if (rpt->clock_rate)
 		RTPE_SAMPLE_SFD_DIR(jitter, jitter, sfd, out);
 
 	struct ssrc_entry_call *other_e = get_ssrc(rr->from, &m->ssrc_hash_in);
@@ -537,8 +538,7 @@ void ssrc_receiver_report(struct call_media *m, stream_fd *sfd, const struct ssr
 		.packetloss = (unsigned int) rr->fraction_lost * 100 / 256,
 	};
 
-	if (!m->call->deleted_us)
-		RTPE_SAMPLE_SFD(jitter, jitter, sfd);
+	RTPE_SAMPLE_SFD(jitter, jitter, sfd);
 	RTPE_SAMPLE_SFD(rtt_e2e, rtt_end2end, sfd);
 	RTPE_SAMPLE_SFD(rtt_dsct, rtt, sfd);
 	RTPE_SAMPLE_SFD(packetloss, ssb->packetloss, sfd);
@@ -769,22 +769,24 @@ out:
  * Collects locally measured RTP jitter for cumulative and current-interval
  * interface statistics.
  *
- * The call master lock must be held for reading. Calls retained during their
- * delete delay are ignored so their last measured jitter is not sampled again.
- * Directional samples are emitted only when the negotiated clock rate is known,
- * ensuring that values published with millisecond field names are correctly scaled.
+ * The call master lock must be held for reading. An SSRC is sampled only after its
+ * RTP packet count has increased, preventing the last calculated jitter value from
+ * being sampled repeatedly after media stops. Directional samples are emitted only
+ * when the negotiated clock rate is known, ensuring that values published with
+ * millisecond field names are correctly scaled.
  *
  * @param media Call media whose ingress SSRC jitter values are sampled.
  * @return No value.
  */
 void ssrc_collect_metrics(struct call_media *media) {
-	if (media->call->deleted_us)
-		return;
-
 	for (GList *l = media->ssrc_hash_in.nq.head; l; l = l->next) {
 		struct ssrc_entry_call *s = l->data;
 		if (!s)
 			break; // end of list
+
+		uint64_t packets = atomic64_get_na(&s->stats->packets);
+		if (packets == atomic64_get_set(&s->jitter_measured_sample_packets, packets))
+			continue;
 
 		// exclude zero values - technically possible but unlikely and probably just unset
 		if (!s->jitter)
