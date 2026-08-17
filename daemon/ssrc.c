@@ -766,8 +766,9 @@ out:
 
 
 /**
- * Collects locally measured RTP jitter for cumulative and current-interval
- * interface statistics.
+ * Collects locally measured RTP jitter for current-interval directional
+ * interface statistics. Valid zero jitter measurements are included there,
+ * while legacy cumulative statistics retain their non-zero-only behaviour.
  *
  * The call master lock must be held for reading. An SSRC is sampled only after its
  * RTP packet count has increased, preventing the last calculated jitter value from
@@ -788,9 +789,6 @@ void ssrc_collect_metrics(struct call_media *media) {
 		if (packets == atomic64_get_set(&s->jitter_measured_sample_packets, packets))
 			continue;
 
-		// exclude zero values - technically possible but unlikely and probably just unset
-		if (!s->jitter)
-			continue;
 		uint32_t jitter = s->jitter >> 4;
 		bool jitter_in_ms = false;
 
@@ -805,10 +803,11 @@ void ssrc_collect_metrics(struct call_media *media) {
 
 		if (media->streams.head) {
 			LOCK(&media->streams.head->data->lock);
-			RTPE_SAMPLE_SFD(jitter_measured, jitter, media->streams.head->data->selected_sfd);
+			stream_fd *sfd = media->streams.head->data->selected_sfd;
+			if (s->jitter)
+				RTPE_SAMPLE_SFD(jitter_measured, jitter, sfd);
 			if (jitter_in_ms)
-				RTPE_SAMPLE_SFD_DIR(jitter_measured, jitter,
-						media->streams.head->data->selected_sfd, in);
+				RTPE_SAMPLE_SFD_DIR(jitter_measured, jitter, sfd, in);
 		}
 	}
 }

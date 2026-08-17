@@ -893,6 +893,9 @@ stats_metric_q *statistics_gather_metrics(struct interface_sampled_rate_stats *i
 						atomic64_get_na(&counter_diff.packets_lost), &packets_lost_rate);
 				METRICs("packets_lost", "%" PRIu64,
 						atomic64_get_na(&packets_lost_rate));
+				// Each received ingress packet provides a fresh local loss observation.
+				METRICs("packets_lost_samples", "%" PRIu64,
+						atomic64_get_na(&diff_in.packets));
 				METRICs("jitter_ms", "%.6f",
 						atomic64_div(&diff_in_sampled.sums.jitter_measured,
 							&diff_in_sampled.counts.jitter_measured));
