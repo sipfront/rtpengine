@@ -55,7 +55,9 @@ static void udptl_local_metrics(struct packet_stream *ps, struct stream_fd *sfd,
 	if (!proto_is(ps->media->protocol, PROTO_UDPTL))
 		return;
 
-	uint16_t seq = ntohs(*((uint16_t *) raw->s));
+	uint16_t seq_net;
+	memcpy(&seq_net, raw->s, sizeof(seq_net));
+	uint16_t seq = ntohs(seq_net);
 	int64_t now = rtpe_now;
 
 	LOCK(&ps->lock);
