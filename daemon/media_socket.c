@@ -123,7 +123,7 @@ static void udptl_local_metrics(struct packet_stream *ps, struct stream_fd *sfd,
 	}
 	ps->udptl_last_rx_ts = now;
 
-	mutex_unlock(&ps->lock);
+	UNLOCK(&ps->lock);
 }
 
 
