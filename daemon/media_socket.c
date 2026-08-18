@@ -69,6 +69,8 @@ static void udptl_local_metrics(struct packet_stream *ps, struct stream_fd *sfd,
 		ps->udptl_last_seq = seq;
 		ps->udptl_seq_init = 1;
 		ps->udptl_spacing_init = 0;
+		ps->udptl_jitter = 0;
+		ps->udptl_last_spacing_us = 0;
 	}
 	else if (!ps->udptl_seq_init) {
 		ps->udptl_last_seq = seq;
