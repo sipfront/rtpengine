@@ -45,6 +45,85 @@
 #define MAX_RECV_LOOP_STRIKES 5
 #endif
 
+// T.38/UDPTL is bursty: long idle gaps between phases are normal and must not
+// be treated as jitter spikes or sequence loss.
+#define UDPTL_BURST_GAP_US 500000LL
+
+static void udptl_local_metrics(struct packet_stream *ps, struct stream_fd *sfd, const str *raw) {
+	if (!ps || !sfd || !sfd->local_intf || !sfd->local_intf->stats || !raw || raw->len < 2)
+		return;
+	if (!proto_is(ps->media->protocol, PROTO_UDPTL))
+		return;
+
+	uint16_t seq_net;
+	memcpy(&seq_net, raw->s, sizeof(seq_net));
+	uint16_t seq = ntohs(seq_net);
+	int64_t now = rtpe_now;
+
+	LOCK(&ps->lock);
+
+	bool burst_break = ps->udptl_last_rx_ts
+		&& (now - ps->udptl_last_rx_ts) > UDPTL_BURST_GAP_US;
+
+	if (burst_break) {
+		ps->udptl_last_seq = seq;
+		ps->udptl_seq_init = 1;
+		ps->udptl_spacing_init = 0;
+		ps->udptl_jitter = 0;
+		ps->udptl_last_spacing_us = 0;
+	}
+	else if (!ps->udptl_seq_init) {
+		ps->udptl_last_seq = seq;
+		ps->udptl_seq_init = 1;
+	}
+	else {
+		uint32_t last_seq = ps->udptl_last_seq;
+		uint32_t new_seq = last_seq;
+		uint16_t old_seq_trunc = last_seq & 0xffff;
+		uint16_t seq_diff = seq - old_seq_trunc;
+
+		if (seq_diff == 0 || seq_diff >= 0xfeff) {
+			// duplicate or old packet, ignore for loss tracking
+		}
+		else if (seq_diff > 0x100) {
+			// large jump: treat like a reset/reinvite, not packet loss
+			ps->udptl_last_seq = seq;
+		}
+		else {
+			new_seq = (last_seq & 0xffff0000U) | seq;
+			while (new_seq < last_seq)
+				new_seq += 0x10000;
+
+			uint32_t diff = new_seq - last_seq;
+			ps->udptl_last_seq = new_seq;
+
+			if (diff > 1) {
+				uint32_t lost_diff = diff - 1;
+				atomic64_add_na(&sfd->local_intf->stats->s.packets_lost, lost_diff);
+				RTPE_STATS_ADD(packets_lost, lost_diff);
+			}
+		}
+	}
+
+	if (ps->udptl_last_rx_ts && !burst_break) {
+		int64_t spacing_us = now - ps->udptl_last_rx_ts;
+		if (ps->udptl_spacing_init) {
+			int64_t d = spacing_us - ps->udptl_last_spacing_us;
+			if (d < 0)
+				d = -d;
+			// same cap as RTP local jitter: ignore implausible spacing jumps
+			if (d < 100000)
+				ps->udptl_jitter += d - ((ps->udptl_jitter + 8) >> 4);
+		}
+		ps->udptl_last_spacing_us = spacing_us;
+		ps->udptl_spacing_init = 1;
+
+		uint32_t jitter_ms = (uint32_t) ((ps->udptl_jitter >> 4) / 1000);
+		RTPE_SAMPLE_SFD_DIR(jitter_measured, jitter_ms, sfd, in);
+	}
+	ps->udptl_last_rx_ts = now;
+}
+
 
 TYPED_GQUEUE(logical_intf, struct logical_intf)
 
@@ -1886,6 +1965,10 @@ static void kernelize(struct packet_stream *stream) {
 		goto no_kernel_warn;
 	if (MEDIA_ISSET(media, GENERATOR))
 		goto no_kernel;
+	// Keep UDPTL in userspace so local loss/jitter metrics are computed there.
+	// The kernel path updates only packet/byte/error counters for non-RTP traffic.
+	if (proto_is(media->protocol, PROTO_UDPTL))
+		goto no_kernel;
 	if (!stream->selected_sfd)
 		goto no_kernel;
 	if (ML_ISSET(media->monologue, BLOCK_MEDIA) || CALL_ISSET(call, BLOCK_MEDIA))
@@ -2903,6 +2986,7 @@ static int stream_packet(struct packet_handler_ctx *phc) {
 	atomic64_inc_na(&phc->mp.sfd->local_intf->stats->in.packets);
 	atomic64_add_na(&phc->mp.sfd->local_intf->stats->in.bytes, phc->s.len);
 	atomic64_set(&phc->mp.stream->last_packet_us, rtpe_now);
+	udptl_local_metrics(phc->mp.stream, phc->mp.sfd, &phc->s);
 	RTPE_STATS_INC(packets_user);
 	RTPE_STATS_ADD(bytes_user, phc->s.len);
 

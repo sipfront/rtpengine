@@ -12,6 +12,8 @@
 #include "media_player.h"
 #include "log_funcs.h"
 #include "sdp.h"
+#include "statistics.h"
+#include "media_socket.h"
 
 
 
@@ -580,7 +582,7 @@ static void __fec_save(struct t38_gateway *tg, const str *piece, uint16_t seq) {
 	g_hash_table_insert(tg->udptl_fec, GUINT_TO_POINTER(seq), up);
 }
 
-int t38_gateway_input_udptl(struct t38_gateway *tg, const str *buf) {
+int t38_gateway_input_udptl(struct t38_gateway *tg, const str *buf, struct stream_fd *sfd) {
 	const char *err = NULL;
 	struct udptl_packet *up = NULL;
 

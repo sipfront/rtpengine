@@ -2890,7 +2890,7 @@ static int handler_func_t38(struct codec_handler *h, struct media_packet *mp) {
 	if (!mp->media)
 		return 0;
 
-	return t38_gateway_input_udptl(mp->media->t38_gateway, &mp->raw);
+	return t38_gateway_input_udptl(mp->media->t38_gateway, &mp->raw, mp->sfd);
 }
 #endif
 

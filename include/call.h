@@ -439,6 +439,13 @@ struct packet_stream {
 	struct stream_stats	*stats_in;
 	struct stream_stats	*stats_out;
 	atomic64		last_packet_us;				// userspace only
+	// UDPTL/T.38 local ingress metrics, protected by ps->lock.
+	uint32_t		udptl_last_seq;
+	int64_t			udptl_last_rx_ts;
+	int64_t			udptl_last_spacing_us;
+	int64_t			udptl_jitter;
+	unsigned int		udptl_seq_init:1;
+	unsigned int		udptl_spacing_init:1;
 	rtp_stats_ht		rtp_stats;				/* LOCK: call->master_lock */
 	struct rtp_stats	*rtp_stats_cache;
 	enum endpoint_learning		el_flags;
