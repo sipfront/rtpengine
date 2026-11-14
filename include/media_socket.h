@@ -278,6 +278,7 @@ struct media_packet {
 
 	codec_packet_q packets_out;
 	int ptime; // returned from decoding
+	bool rec_sent; // when recorded: a packet we send (fsin is where it goes), not one we received
 };
 
 

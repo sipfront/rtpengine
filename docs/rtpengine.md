@@ -839,6 +839,18 @@ call to inject-DTMF won't be sent to __\-\-dtmf-log-dest=__ or __\-\-listen-tcp-
     possible to include manipulated and generated media (such as from the __play
     media__ command) in the recordings.
 
+- __\-\-record-both__
+
+    In the __pcap__ recording method, record egress media streams in addition
+    to ingress media streams: a recording then holds the media a call received
+    as well as the media that was sent to it, relayed or generated (such as
+    from the __play media__ command). Each packet is written with the addresses
+    of its direction: a received packet from the remote endpoint to the local
+    socket, a sent one from the local socket to the remote endpoint. Media that
+    is relayed unchanged therefore appears twice, once coming in and once going
+    out. Has no effect together with __record-egress__, which records egress
+    media only.
+
 - __\-\-iptables-chain=__*STRING*
 
     This option enables explicit management of an iptables chain.

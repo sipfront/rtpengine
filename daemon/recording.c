@@ -719,7 +719,9 @@ static void rec_pcap_recording_finish_file(struct recording *recording) {
 // "out" must be at least inp->len + MAX_PACKET_HEADER_LEN bytes
 static unsigned int fake_ip_header(unsigned char *out, struct media_packet *mp, const str *inp) {
 	endpoint_t *src_endpoint, *dst_endpoint;
-        if (!rtpe_config.rec_egress) {
+	// A packet we received is written as it came in; one we send (all of them with
+	// record-egress, the media player's with record-both) as it goes out.
+        if (!rtpe_config.rec_egress && !mp->rec_sent) {
                 src_endpoint = &mp->fsin;
                 dst_endpoint = &mp->sfd->socket.local;
         }
@@ -772,7 +774,8 @@ static void stream_pcap_dump(struct media_packet *mp, const str *s) {
 }
 
 static void dump_packet_pcap(struct media_packet *mp, const str *s) {
-	if (ML_ISSET(mp->media->monologue, NO_RECORDING))
+	// (a packet on its way out may come without its media)
+	if (mp->media && ML_ISSET(mp->media->monologue, NO_RECORDING))
 		return;
 	if (!CALL_ISSET(mp->call, RECORDING_ON))
 		return;
