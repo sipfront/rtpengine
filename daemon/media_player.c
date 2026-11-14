@@ -367,13 +367,19 @@ static bool __send_timer_send_1(struct rtp_header *rh, struct packet_stream *sin
 	req->buf = bufferpool_ref(cp->s.s);
 	uring_methods.sendmsg(&sink_fd->socket, &req->msg, &sink->endpoint, &req->sin, &req->req);
 
-	if (sink->call->recording && rtpe_config.rec_egress) {
+	// What is sent is recorded with record-egress, and with record-both also where
+	// the recording is otherwise of what is received: a call then has both what it
+	// heard and what it was sent (relayed or played) in its recording, each packet
+	// with the addresses of its direction.
+	if (sink->call->recording && (rtpe_config.rec_egress || rtpe_config.rec_both)) {
 		// fill in required members
 		struct media_packet mp = {
 			.call = sink->call,
 			.stream = sink,
+			.media = sink->media,
 			.sfd = sink_fd,
 			.fsin = sink->endpoint,
+			.rec_sent = true,
 		};
 		dump_packet(&mp, cp->plain.s ? &cp->plain : &cp->s);
 	}

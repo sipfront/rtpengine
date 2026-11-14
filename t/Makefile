@@ -104,7 +104,7 @@ include ../lib/common.Makefile
 .PHONY:		all-tests unit-tests daemon-tests daemon-tests \
 	daemon-tests-main daemon-tests-jb daemon-tests-dtx daemon-tests-dtx-cn daemon-tests-pubsub \
 	daemon-tests-intfs daemon-tests-stats daemon-tests-delay-buffer daemon-tests-delay-timing \
-	daemon-tests-evs daemon-tests-player-cache daemon-tests-redis daemon-tests-redis-json \
+	daemon-tests-evs daemon-tests-player-cache daemon-tests-rec-both daemon-tests-redis daemon-tests-redis-json \
 	daemon-tests-measure-rtp daemon-tests-mos-legacy daemon-tests-mos-fullband daemon-tests-config-file \
 	daemon-tests-templ-def daemon-tests-templ-def-offer daemon-tests-t38 daemon-tests-evs-dtx \
 	daemon-tests-transform daemon-tests-http daemon-tests-heuristic daemon-tests-asymmetric \
@@ -147,7 +147,7 @@ unit-tests:	$(TESTS) aead-decrypt
 daemon-tests: daemon-tests-main daemon-tests-jb daemon-tests-pubsub daemon-tests-websocket \
 	daemon-tests-evs daemon-tests-async-tc \
 	daemon-tests-audio-player daemon-tests-audio-player-play-media \
-	daemon-tests-intfs daemon-tests-stats daemon-tests-player-cache daemon-tests-redis \
+	daemon-tests-intfs daemon-tests-stats daemon-tests-player-cache daemon-tests-rec-both daemon-tests-redis \
 	daemon-tests-rtpp-flags daemon-tests-redis-json daemon-tests-measure-rtp daemon-tests-mos-legacy \
 	daemon-tests-mos-fullband daemon-tests-config-file \
 	daemon-tests-templ-def daemon-tests-templ-def-offer \
@@ -209,6 +209,9 @@ daemon-tests-evs:	daemon-test-deps
 
 daemon-tests-player-cache:	daemon-test-deps
 	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-player-cache.pl
+
+daemon-tests-rec-both:	daemon-test-deps
+	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-rec-both.pl
 
 daemon-tests-redis:	daemon-test-deps
 	./auto-test-helper "$@" perl -I../perl auto-daemon-tests-redis.pl
