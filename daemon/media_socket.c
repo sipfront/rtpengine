@@ -118,8 +118,9 @@ static void udptl_local_metrics(struct packet_stream *ps, struct stream_fd *sfd,
 		ps->udptl_last_spacing_us = spacing_us;
 		ps->udptl_spacing_init = 1;
 
-		uint32_t jitter_ms = (uint32_t) ((ps->udptl_jitter >> 4) / 1000);
-		RTPE_SAMPLE_SFD_DIR(jitter_measured, jitter_ms, sfd, in);
+		// the directional accumulator holds microseconds
+		uint64_t jitter_us = ps->udptl_jitter >> 4;
+		RTPE_SAMPLE_SFD_DIR(jitter_measured, jitter_us, sfd, in);
 	}
 	ps->udptl_last_rx_ts = now;
 }

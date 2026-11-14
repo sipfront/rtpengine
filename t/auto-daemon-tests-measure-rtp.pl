@@ -686,6 +686,87 @@ cmp_ok $resp->{SSRC}{0x7654321}{'average MOS'}{'packet loss'}, '<=', 9, 'metric 
 }
 
 
+# received media is measured (jitter, sequence gaps) even while it is blocked:
+# block-media plus play-media is how a media stream is terminated locally
+
+($sock_a, $sock_b) = new_call([qw(198.51.100.43 3100)], [qw(198.51.100.43 3102)]);
+
+($port_a) = offer('measure blocked media', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+c=IN IP4 198.51.100.43
+t=0 0
+m=audio 3100 RTP/AVP 0
+-----------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+($port_b) = answer('measure blocked media', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+c=IN IP4 198.51.100.43
+t=0 0
+m=audio 3102 RTP/AVP 0
+-----------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+snd($sock_a, $port_b, rtp(0, 1000, 3000, 0x2345678, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(0, 1000, 3000, 0x2345678, "\x00" x 160));
+
+rtpe_req('block media', 'measure blocked media', { });
+
+sub intf_ingress {
+	my $r = rtpe_req('statistics', 'measure blocked media stats', { });
+	my ($intf) = grep { $_->{address} eq '203.0.113.1' } @{$r->{statistics}{interfaces}};
+	return $intf->{ingress};
+}
+
+my $before = intf_ingress();
+
+# 2.4 seconds of packets spaced 10 and 30 ms in turn (a steady 20 ms of jitter on every
+# packet), every tenth one missing
+for my $iter (1 .. 120) {
+	snd($sock_a, $port_b, rtp(0, 1000 + $iter, 3000 + 160 * $iter, 0x2345678, "\x00" x 160))
+		if $iter % 10;
+	Time::HiRes::usleep($iter % 2 ? 10000 : 30000);
+}
+rcv_no($sock_b);
+# the samples are collected by the once-per-second call timer
+Time::HiRes::sleep(1.2);
+
+my $after = intf_ingress();
+my $samples = $after->{jitter_samples} - $before->{jitter_samples};
+cmp_ok $samples, '>=', 1, 'blocked media: jitter was sampled';
+my $jitter = ($after->{jitter_average_ms} * $after->{jitter_samples}
+		- $before->{jitter_average_ms} * $before->{jitter_samples}) / ($samples || 1);
+cmp_ok $jitter, '>=', 5, 'blocked media: jitter is measured';
+cmp_ok $jitter, '<=', 25, 'blocked media: jitter is in milliseconds';
+# a gap counts as lost once it has left the 32-packet window, so the last ones are not in yet
+cmp_ok $after->{packets_lost} - $before->{packets_lost}, '>=', 6, 'blocked media: lost packets are counted';
+cmp_ok $after->{packets_lost} - $before->{packets_lost}, '<=', 12, 'blocked media: lost packets are counted once';
+diag("blocked media: jitter $jitter ms over $samples samples, lost " . ($after->{packets_lost} - $before->{packets_lost}));
+
+rtpe_req('delete', 'measure blocked media', { });
+
 
 
 #done_testing;NGCP::Rtpengine::AutoTest::terminate('f00');exit;
