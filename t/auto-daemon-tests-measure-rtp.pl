@@ -690,50 +690,57 @@ cmp_ok $resp->{SSRC}{0x7654321}{'average MOS'}{'packet loss'}, '<=', 9, 'metric 
 # block-media plus play-media is how a media stream is terminated locally
 
 # relayed as it is, and through a transcoder (which counts loss in its sequencer)
-for my $flags ([], ['always transcode']) {
+for my $transcode (0, 1) {
 
 ($sock_a, $sock_b) = new_call([qw(198.51.100.43 3100)], [qw(198.51.100.43 3102)]);
 
-($port_a) = offer('measure blocked media', { flags => [@$flags] }, <<SDP);
+my $offer_out = $transcode
+	? "m=audio PORT RTP/AVP 0 8 101\nc=IN IP4 203.0.113.1\na=rtpmap:0 PCMU/8000\na=rtpmap:8 PCMA/8000\na=rtpmap:101 telephone-event/8000\n"
+	: "m=audio PORT RTP/AVP 0 101\nc=IN IP4 203.0.113.1\na=rtpmap:0 PCMU/8000\na=rtpmap:101 telephone-event/8000\n";
+my $answer_pt = $transcode ? 8 : 0;
+
+($port_a) = offer('measure blocked media', { $transcode ? (codec => { transcode => ['PCMA'] }) : () }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.43
 s=tester
 c=IN IP4 198.51.100.43
 t=0 0
-m=audio 3100 RTP/AVP 0
+m=audio 3100 RTP/AVP 0 101
+a=rtpmap:101 telephone-event/8000
 -----------------------------------------
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.43
 s=tester
 t=0 0
-m=audio PORT RTP/AVP 0
-c=IN IP4 203.0.113.1
-a=rtpmap:0 PCMU/8000
-a=sendrecv
+${offer_out}a=sendrecv
 a=rtcp:PORT
 SDP
 
-($port_b) = answer('measure blocked media', { flags => [@$flags] }, <<SDP);
+($port_b) = answer('measure blocked media', { }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.43
 s=tester
 c=IN IP4 198.51.100.43
 t=0 0
-m=audio 3102 RTP/AVP 0
+m=audio 3102 RTP/AVP $answer_pt 101
+a=rtpmap:101 telephone-event/8000
 -----------------------------------------
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.43
 s=tester
 t=0 0
-m=audio PORT RTP/AVP 0
+m=audio PORT RTP/AVP 0 101
 c=IN IP4 203.0.113.1
 a=rtpmap:0 PCMU/8000
+a=rtpmap:101 telephone-event/8000
 a=sendrecv
 a=rtcp:PORT
 SDP
 
-snd($sock_a, $port_b, rtp(0, 1000, 3000, 0x2345678, "\x00" x 160));
-rcv($sock_b, $port_a, rtpm(0, -1, -1, -1, "\x00" x 160));
+if (!$transcode) {
+	snd($sock_a, $port_b, rtp(0, 1000, 3000, 0x2345678, "\x00" x 160));
+	rcv($sock_b, $port_a, rtpm(0, 1000, 3000, 0x2345678, "\x00" x 160));
+}
 
 rtpe_req('block media', 'measure blocked media', { });
 
@@ -748,11 +755,17 @@ my $before = $intf_ingress->();
 # 2.4 seconds of packets spaced 10 and 30 ms in turn (a steady 20 ms of jitter on every
 # packet), every tenth one missing
 for my $iter (1 .. 120) {
-	snd($sock_a, $port_b, rtp(0, 1000 + $iter, 3000 + 160 * $iter, 0x2345678, "\x00" x 160))
-		if $iter % 10;
+	if ($iter >= 41 && $iter <= 46) {
+		# a DTMF event in between: it shares the sequence numbers and is no gap
+		snd($sock_a, $port_b, rtp(101, 1000 + $iter, 3000 + 160 * 41, 0x2345678,
+				"\x05\x0a" . pack('n', 160 * ($iter - 40))));
+	}
+	elsif ($iter % 10) {
+		snd($sock_a, $port_b, rtp(0, 1000 + $iter, 3000 + 160 * $iter, 0x2345678, "\x00" x 160));
+	}
 	Time::HiRes::usleep($iter % 2 ? 10000 : 30000);
 }
-rcv_no($sock_b);
+# (nothing of the audio is relayed; the DTMF event is, as block-media lets events through)
 # the samples are collected by the once-per-second call timer
 Time::HiRes::sleep(1.2);
 
