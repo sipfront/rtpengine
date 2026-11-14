@@ -689,9 +689,12 @@ cmp_ok $resp->{SSRC}{0x7654321}{'average MOS'}{'packet loss'}, '<=', 9, 'metric 
 # received media is measured (jitter, sequence gaps) even while it is blocked:
 # block-media plus play-media is how a media stream is terminated locally
 
+# relayed as it is, and through a transcoder (which counts loss in its sequencer)
+for my $flags ([], ['always transcode']) {
+
 ($sock_a, $sock_b) = new_call([qw(198.51.100.43 3100)], [qw(198.51.100.43 3102)]);
 
-($port_a) = offer('measure blocked media', { }, <<SDP);
+($port_a) = offer('measure blocked media', { flags => [@$flags] }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.43
 s=tester
@@ -710,7 +713,7 @@ a=sendrecv
 a=rtcp:PORT
 SDP
 
-($port_b) = answer('measure blocked media', { }, <<SDP);
+($port_b) = answer('measure blocked media', { flags => [@$flags] }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.43
 s=tester
@@ -730,17 +733,17 @@ a=rtcp:PORT
 SDP
 
 snd($sock_a, $port_b, rtp(0, 1000, 3000, 0x2345678, "\x00" x 160));
-rcv($sock_b, $port_a, rtpm(0, 1000, 3000, 0x2345678, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(0, -1, -1, -1, "\x00" x 160));
 
 rtpe_req('block media', 'measure blocked media', { });
 
-sub intf_ingress {
+my $intf_ingress = sub {
 	my $r = rtpe_req('statistics', 'measure blocked media stats', { });
 	my ($intf) = grep { $_->{address} eq '203.0.113.1' } @{$r->{statistics}{interfaces}};
 	return $intf->{ingress};
-}
+};
 
-my $before = intf_ingress();
+my $before = $intf_ingress->();
 
 # 2.4 seconds of packets spaced 10 and 30 ms in turn (a steady 20 ms of jitter on every
 # packet), every tenth one missing
@@ -753,7 +756,7 @@ rcv_no($sock_b);
 # the samples are collected by the once-per-second call timer
 Time::HiRes::sleep(1.2);
 
-my $after = intf_ingress();
+my $after = $intf_ingress->();
 my $samples = $after->{jitter_samples} - $before->{jitter_samples};
 cmp_ok $samples, '>=', 1, 'blocked media: jitter was sampled';
 my $jitter = ($after->{jitter_average_ms} * $after->{jitter_samples}
@@ -766,6 +769,8 @@ cmp_ok $after->{packets_lost} - $before->{packets_lost}, '<=', 12, 'blocked medi
 diag("blocked media: jitter $jitter ms over $samples samples, lost " . ($after->{packets_lost} - $before->{packets_lost}));
 
 rtpe_req('delete', 'measure blocked media', { });
+
+}
 
 
 
