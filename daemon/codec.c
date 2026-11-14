@@ -2414,10 +2414,12 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 
 		// `seq->lost_count` is a cumulative counter. Mirror its delta into global/interface counters
 		// so that interface-level loss metrics are also available in userspace-only operation.
+		// What was counted while the media was blocked (and never reached a sequencer) stays in.
 		uint32_t prev_lost = ssrc_in->packets_lost;
-		ssrc_in->packets_lost = seq->lost_count;
-		if (seq->lost_count > prev_lost) {
-			uint32_t diff_lost = seq->lost_count - prev_lost;
+		uint32_t seq_lost = seq->lost_count + ssrc_in->packets_lost_blocked;
+		ssrc_in->packets_lost = seq_lost;
+		if (seq_lost > prev_lost) {
+			uint32_t diff_lost = seq_lost - prev_lost;
 			if (mp->sfd && mp->sfd->local_intf && mp->sfd->local_intf->stats)
 				atomic64_add_na(&mp->sfd->local_intf->stats->s.packets_lost, diff_lost);
 			RTPE_STATS_ADD(packets_lost, diff_lost);
@@ -5040,17 +5042,50 @@ static uint32_t codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq) {
 #ifdef WITH_TRANSCODING
 
 
+// Blocked media is still received, but a blocked packet never reaches the sequencer, which
+// is where the transcoding path counts loss: measure jitter and sequence gaps here instead.
+// The gap tracker starts afresh with every blocked stretch, so that what the sequencer saw
+// in between is not taken for a gap, and its count is kept apart (packets_lost_blocked) for
+// the sequencer's own cumulative count to be added to instead of replacing it.
+static void handler_measure_blocked_transcode(struct codec_handler *h, struct media_packet *mp) {
+	struct codec_handler *ih = h->source_pt.codec_def->supplemental
+		? __input_handler(h, mp) : h;
+	codec_calc_jitter(mp->ssrc_in, ntohl(mp->rtp->timestamp), ih->source_pt.clock_rate, mp->tv);
+
+	struct ssrc_entry_call *ssrc = mp->ssrc_in;
+	if (!ssrc)
+		return;
+	uint16_t seq = ntohs(mp->rtp->seq_num);
+	{
+		LOCK(&ssrc->h.lock);
+		if (!ssrc->blocked_loss_tracking) {
+			ssrc->blocked_loss_tracking = true;
+			ssrc->last_seq_tracked = seq;
+			ssrc->lost_bits = -1;
+			return;
+		}
+	}
+	uint32_t lost_diff = codec_calc_lost(ssrc, seq);
+	if (!lost_diff)
+		return;
+	{
+		LOCK(&ssrc->h.lock);
+		ssrc->packets_lost_blocked += lost_diff;
+	}
+	if (mp->sfd && mp->sfd->local_intf && mp->sfd->local_intf->stats)
+		atomic64_add_na(&mp->sfd->local_intf->stats->s.packets_lost, lost_diff);
+	RTPE_STATS_ADD(packets_lost, lost_diff);
+}
 static int handler_func_transcode(struct codec_handler *h, struct media_packet *mp) {
 	if (G_UNLIKELY(!mp->rtp))
 		return handler_func_passthrough(h, mp);
 	if (!handler_silence_block(h, mp)) {
-		// blocked media is still received: keep measuring its jitter. (Loss in this
-		// path comes from the sequencer, which a blocked packet never reaches.)
-		struct codec_handler *ih = h->source_pt.codec_def->supplemental
-			? __input_handler(h, mp) : h;
-		codec_calc_jitter(mp->ssrc_in, ntohl(mp->rtp->timestamp), ih->source_pt.clock_rate,
-				mp->tv);
+		handler_measure_blocked_transcode(h, mp);
 		return 0;
+	}
+	if (G_UNLIKELY(mp->ssrc_in && mp->ssrc_in->blocked_loss_tracking)) {
+		LOCK(&mp->ssrc_in->h.lock);
+		mp->ssrc_in->blocked_loss_tracking = false;
 	}
 
 	// use main codec handler for supp codecs
