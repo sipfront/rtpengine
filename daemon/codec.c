@@ -59,6 +59,8 @@ static rtp_payload_type *codec_store_find_compatible(struct codec_store *cs,
 		const rtp_payload_type *pt);
 static void __rtp_payload_type_add_name(codec_names_ht, rtp_payload_type *pt);
 static uint32_t codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq);
+static uint32_t __codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq);
+static void handler_track_blocked_loss(struct media_packet *mp);
 static void __codec_options_set(call_t *call, rtp_payload_type *pt, str_case_value_ht codec_set);
 
 
@@ -2166,8 +2168,11 @@ static void codec_add_raw_packet_dup(struct media_packet *mp, unsigned int clock
 	codec_add_raw_packet_common(mp, clockrate, p);
 }
 #endif
+static bool handler_media_blocked(struct media_packet *mp) {
+	return CALL_ISSET(mp->call, BLOCK_MEDIA) || ML_ISSET(mp->media->monologue, BLOCK_MEDIA) || mp->sink.attrs.block_media || MEDIA_ISSET(mp->media_out, BLOCK_EGRESS);
+}
 static bool handler_silence_block(struct codec_handler *h, struct media_packet *mp) {
-	if (CALL_ISSET(mp->call, BLOCK_MEDIA) || ML_ISSET(mp->media->monologue, BLOCK_MEDIA) || mp->sink.attrs.block_media || MEDIA_ISSET(mp->media_out, BLOCK_EGRESS))
+	if (handler_media_blocked(mp))
 		return false;
 	if (CALL_ISSET(mp->call, SILENCE_MEDIA) || ML_ISSET(mp->media->monologue, SILENCE_MEDIA) || mp->sink.attrs.silence_media) {
 		if (h->source_pt.codec_def && h->source_pt.codec_def->silence_pattern.len) {
@@ -2889,6 +2894,12 @@ static int handler_func_dtmf(struct codec_handler *h, struct media_packet *mp) {
 	// let it run through packet_dtmf, which will process it and then drop it
 	if (h->dtmf_payload_type == -1 && handler_silence_block(h, mp))
 		return handler_func_transcode(h, mp);
+
+	// A blocked event still goes on to packet_dtmf below, not through handler_func_transcode:
+	// it shares the sequence numbers of the blocked audio, so the gap tracker has to see it,
+	// or it would be taken for a lost packet.
+	if (mp->rtp && handler_media_blocked(mp))
+		handler_track_blocked_loss(mp);
 
 	return __handler_func_supplemental(h, mp, packet_dtmf, packet_dtmf_dup);
 }
@@ -4984,6 +4995,11 @@ void codec_calc_jitter(struct ssrc_entry_call *ssrc, unsigned long ts, unsigned 
 }
 static uint32_t codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq) {
 	LOCK(&ssrc->h.lock);
+	ssrc->lost_tracker_current = true;
+	return __codec_calc_lost(ssrc, seq);
+}
+// ssrc is locked
+static uint32_t __codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq) {
 	uint32_t before_lost = ssrc->packets_lost;
 
 	// XXX shared code from kernel module
@@ -5042,39 +5058,43 @@ static uint32_t codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq) {
 #ifdef WITH_TRANSCODING
 
 
-// Blocked media is still received, but a blocked packet never reaches the sequencer, which
-// is where the transcoding path counts loss: measure jitter and sequence gaps here instead.
-// The gap tracker starts afresh with every blocked stretch, so that what the sequencer saw
-// in between is not taken for a gap, and its count is kept apart (packets_lost_blocked) for
-// the sequencer's own cumulative count to be added to instead of replacing it.
-static void handler_measure_blocked_transcode(struct codec_handler *h, struct media_packet *mp) {
-	struct codec_handler *ih = h->source_pt.codec_def->supplemental
-		? __input_handler(h, mp) : h;
-	codec_calc_jitter(mp->ssrc_in, ntohl(mp->rtp->timestamp), ih->source_pt.clock_rate, mp->tv);
-
+// Blocked media is still received, but a blocked audio packet never reaches the sequencer,
+// which is where the transcoding path counts loss: sequence gaps are tracked here instead.
+// The gap tracker starts afresh when a sequencer has been counting in between (the tracker
+// is not current then), so that what the sequencer saw is not taken for a gap; where the
+// audio is relayed as it is, the tracker runs all the time and just carries on. The count
+// of the blocked stretches is kept apart (packets_lost_blocked) for
+// the sequencer's own cumulative count to be added to instead of replacing it. Tracker,
+// total and blocked part change together under the SSRC lock, which the sequencer holds
+// as well when it mirrors its count.
+static void handler_track_blocked_loss(struct media_packet *mp) {
 	struct ssrc_entry_call *ssrc = mp->ssrc_in;
 	if (!ssrc)
 		return;
 	uint16_t seq = ntohs(mp->rtp->seq_num);
+	uint32_t lost_diff;
 	{
 		LOCK(&ssrc->h.lock);
-		if (!ssrc->blocked_loss_tracking) {
-			ssrc->blocked_loss_tracking = true;
+		if (!ssrc->lost_tracker_current) {
+			ssrc->lost_tracker_current = true;
 			ssrc->last_seq_tracked = seq;
 			ssrc->lost_bits = -1;
 			return;
 		}
-	}
-	uint32_t lost_diff = codec_calc_lost(ssrc, seq);
-	if (!lost_diff)
-		return;
-	{
-		LOCK(&ssrc->h.lock);
+		lost_diff = __codec_calc_lost(ssrc, seq);
 		ssrc->packets_lost_blocked += lost_diff;
 	}
+	if (!lost_diff)
+		return;
 	if (mp->sfd && mp->sfd->local_intf && mp->sfd->local_intf->stats)
 		atomic64_add_na(&mp->sfd->local_intf->stats->s.packets_lost, lost_diff);
 	RTPE_STATS_ADD(packets_lost, lost_diff);
+}
+static void handler_measure_blocked_transcode(struct codec_handler *h, struct media_packet *mp) {
+	struct codec_handler *ih = h->source_pt.codec_def->supplemental
+		? __input_handler(h, mp) : h;
+	codec_calc_jitter(mp->ssrc_in, ntohl(mp->rtp->timestamp), ih->source_pt.clock_rate, mp->tv);
+	handler_track_blocked_loss(mp);
 }
 static int handler_func_transcode(struct codec_handler *h, struct media_packet *mp) {
 	if (G_UNLIKELY(!mp->rtp))
@@ -5083,9 +5103,10 @@ static int handler_func_transcode(struct codec_handler *h, struct media_packet *
 		handler_measure_blocked_transcode(h, mp);
 		return 0;
 	}
-	if (G_UNLIKELY(mp->ssrc_in && mp->ssrc_in->blocked_loss_tracking)) {
+	if (mp->ssrc_in && h->transcoder) {
+		// from here on the sequencer counts what is lost
 		LOCK(&mp->ssrc_in->h.lock);
-		mp->ssrc_in->blocked_loss_tracking = false;
+		mp->ssrc_in->lost_tracker_current = false;
 	}
 
 	// use main codec handler for supp codecs
