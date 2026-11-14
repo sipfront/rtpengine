@@ -755,10 +755,12 @@ my $before = $intf_ingress->();
 # 2.4 seconds of packets spaced 10 and 30 ms in turn (a steady 20 ms of jitter on every
 # packet), every tenth one missing
 for my $iter (1 .. 120) {
-	if ($iter >= 41 && $iter <= 46) {
-		# a DTMF event in between: it shares the sequence numbers and is no gap
-		snd($sock_a, $port_b, rtp(101, 1000 + $iter, 3000 + 160 * 41, 0x2345678,
-				"\x05\x0a" . pack('n', 160 * ($iter - 40))));
+	if (($iter >= 41 && $iter <= 46) || ($iter >= 91 && $iter <= 93)) {
+		# two DTMF events in between: they share the sequence numbers and are no gaps,
+		# and the audio between them is not lost either
+		my $start = $iter < 90 ? 41 : 91;
+		snd($sock_a, $port_b, rtp(101, 1000 + $iter, 3000 + 160 * $start, 0x2345678,
+				"\x05\x0a" . pack('n', 160 * ($iter - $start + 1))));
 	}
 	elsif ($iter % 10) {
 		snd($sock_a, $port_b, rtp(0, 1000 + $iter, 3000 + 160 * $iter, 0x2345678, "\x00" x 160));
