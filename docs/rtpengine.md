@@ -848,8 +848,15 @@ call to inject-DTMF won't be sent to __\-\-dtmf-log-dest=__ or __\-\-listen-tcp-
     of its direction: a received packet from the remote endpoint to the local
     socket, a sent one from the local socket to the remote endpoint. Media that
     is relayed unchanged therefore appears twice, once coming in and once going
-    out. Has no effect together with __record-egress__, which records egress
-    media only.
+    out. Sent SRTP is recorded as it was before encryption. Has no effect
+    together with __record-egress__, which records egress media only, and none
+    on the __proc__ method (with __all__, only the pcap holds both directions).
+
+    Two limits: media played by the kernel player (__kernel-player__ with
+    __player-cache__) does not pass through the daemon and is not recorded;
+    and a party excluded from recording (__exclude recording__) is left out of
+    what is received from it, but not of the copies of its media that are sent
+    on to a party that is recorded.
 
 - __\-\-iptables-chain=__*STRING*
 

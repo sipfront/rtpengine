@@ -2517,7 +2517,9 @@ int media_packet_encrypt(rewrite_func encrypt_func, struct packet_stream *out, s
 
 	for (__auto_type l = mp->packets_out.head; l; l = l->next) {
 		struct codec_packet *p = l->data;
-		if (mp->call->recording && rtpe_config.rec_egress && CALL_ISSET(mp->call, RECORDING_ON)) {
+		// (what is sent is recorded as it was before encryption, also with record-both)
+		if (mp->call->recording && (rtpe_config.rec_egress || rtpe_config.rec_both)
+				&& CALL_ISSET(mp->call, RECORDING_ON)) {
 			p->plain = STR_LEN(bufferpool_alloc(media_bufferpool, p->s.len), p->s.len);
 			memcpy(p->plain.s, p->s.s, p->s.len);
 			p->plain_free_func = bufferpool_unref;
