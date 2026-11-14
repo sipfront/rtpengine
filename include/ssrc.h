@@ -95,7 +95,7 @@ struct ssrc_entry_call {
 	uint32_t last_seq_tracked;
 	uint32_t lost_bits; // sliding bitfield, [0] = ext_seq
 	uint32_t packets_lost; // locally measured (sequence-gap based) cumulative packets lost
-	uint32_t packets_lost_blocked; // the part of packets_lost counted while transcoded media was blocked
+	uint32_t seq_lost_seen; // the sequencer's cumulative loss count as last looked at
 	bool lost_tracker_current; // last_seq_tracked/lost_bits follow the stream (no sequencer counted since)
 	uint32_t packets_lost_rtcp; // RTCP cumulative number of packets lost (RR)
 	int32_t directional_packets_lost_rtcp; // last signed RTCP cumulative loss used for directional metrics
