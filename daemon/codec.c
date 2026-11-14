@@ -2184,21 +2184,26 @@ static bool handler_silence_block(struct codec_handler *h, struct media_packet *
 	}
 	return true;
 }
+// Measures what was received (jitter, sequence gaps) for a packet that is not transcoded.
+// Must run before the media-blocking check: blocked media is still received, and a stream
+// we terminate ourselves (block-media plus play-media) is otherwise never measured at all.
+static void handler_measure_ingress(struct codec_handler *h, struct media_packet *mp) {
+	codec_calc_jitter(mp->ssrc_in, ntohl(mp->rtp->timestamp), h->source_pt.clock_rate, mp->tv);
+	uint32_t lost_diff = codec_calc_lost(mp->ssrc_in, ntohs(mp->rtp->seq_num));
+	if (lost_diff) {
+		if (mp->sfd && mp->sfd->local_intf && mp->sfd->local_intf->stats)
+			atomic64_add_na(&mp->sfd->local_intf->stats->s.packets_lost, lost_diff);
+		RTPE_STATS_ADD(packets_lost, lost_diff);
+	}
+}
 static int handler_func_passthrough(struct codec_handler *h, struct media_packet *mp) {
+	if (mp->rtp)
+		handler_measure_ingress(h, mp);
+
 	if (!handler_silence_block(h, mp))
 		return 0;
 
-	uint32_t ts = 0;
 	if (mp->rtp) {
-		ts = ntohl(mp->rtp->timestamp);
-		codec_calc_jitter(mp->ssrc_in, ts, h->source_pt.clock_rate, mp->tv);
-		uint32_t lost_diff = codec_calc_lost(mp->ssrc_in, ntohs(mp->rtp->seq_num));
-		if (lost_diff) {
-			if (mp->sfd && mp->sfd->local_intf && mp->sfd->local_intf->stats)
-				atomic64_add_na(&mp->sfd->local_intf->stats->s.packets_lost, lost_diff);
-			RTPE_STATS_ADD(packets_lost, lost_diff);
-		}
-
 		if (ML_ISSET(mp->media->monologue, BLOCK_SHORT) && h->source_pt.codec_def
 				&& h->source_pt.codec_def->fixed_sizes)
 		{
@@ -3055,17 +3060,11 @@ static int handler_func_passthrough_stub(struct codec_handler *h, struct media_p
 static int handler_func_passthrough_ssrc(struct codec_handler *h, struct media_packet *mp) {
 	if (G_UNLIKELY(!mp->rtp))
 		return handler_func_passthrough(h, mp);
+
+	handler_measure_ingress(h, mp);
+
 	if (!handler_silence_block(h, mp))
 		return 0;
-
-	uint32_t ts = ntohl(mp->rtp->timestamp);
-	codec_calc_jitter(mp->ssrc_in, ts, h->source_pt.clock_rate, mp->tv);
-	uint32_t lost_diff = codec_calc_lost(mp->ssrc_in, ntohs(mp->rtp->seq_num));
-	if (lost_diff) {
-		if (mp->sfd && mp->sfd->local_intf && mp->sfd->local_intf->stats)
-			atomic64_add_na(&mp->sfd->local_intf->stats->s.packets_lost, lost_diff);
-		RTPE_STATS_ADD(packets_lost, lost_diff);
-	}
 
 	// save original payload in case DTMF mangles it
 	str orig_raw = mp->raw;
@@ -4966,7 +4965,10 @@ void codec_calc_jitter(struct ssrc_entry_call *ssrc, unsigned long ts, unsigned 
 		return;
 
 	// RFC 3550 A.8
-	uint32_t transit = (((tv / 1000) * clockrate) / 1000) - ts;
+	// arrival time in clock units at microsecond resolution; seconds and the remainder
+	// are scaled separately as their product with the clock rate overflows 64 bits
+	uint32_t transit = (uint32_t) ((uint64_t) (tv / 1000000) * clockrate
+			+ (uint64_t) (tv % 1000000) * clockrate / 1000000) - ts;
 	LOCK(&ssrc->h.lock);
 	int32_t d = 0;
 	if (ssrc->transit)
@@ -5041,8 +5043,15 @@ static uint32_t codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq) {
 static int handler_func_transcode(struct codec_handler *h, struct media_packet *mp) {
 	if (G_UNLIKELY(!mp->rtp))
 		return handler_func_passthrough(h, mp);
-	if (!handler_silence_block(h, mp))
+	if (!handler_silence_block(h, mp)) {
+		// blocked media is still received: keep measuring its jitter. (Loss in this
+		// path comes from the sequencer, which a blocked packet never reaches.)
+		struct codec_handler *ih = h->source_pt.codec_def->supplemental
+			? __input_handler(h, mp) : h;
+		codec_calc_jitter(mp->ssrc_in, ntohl(mp->rtp->timestamp), ih->source_pt.clock_rate,
+				mp->tv);
 		return 0;
+	}
 
 	// use main codec handler for supp codecs
 	if (h->source_pt.codec_def->supplemental) {

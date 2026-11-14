@@ -790,12 +790,15 @@ void ssrc_collect_metrics(struct call_media *media) {
 			continue;
 
 		uint32_t jitter = s->jitter >> 4;
+		uint64_t jitter_us = 0; // directional sample, keeps the fraction of a millisecond
 		bool jitter_in_ms = false;
 
 		if (s->tracker.most_len > 0 && s->tracker.most[0] != 255) {
 			const rtp_payload_type *rpt = get_rtp_payload_type(s->tracker.most[0],
 					&media->codecs);
 			if (rpt && rpt->clock_rate) {
+				// s->jitter is the RFC 3550 estimate in clock units, scaled by 16
+				jitter_us = (uint64_t) s->jitter * 1000000 / ((uint64_t) rpt->clock_rate * 16);
 				jitter = (uint64_t) jitter * 1000 / rpt->clock_rate;
 				jitter_in_ms = true;
 			}
@@ -807,7 +810,7 @@ void ssrc_collect_metrics(struct call_media *media) {
 			if (s->jitter)
 				RTPE_SAMPLE_SFD(jitter_measured, jitter, sfd);
 			if (jitter_in_ms)
-				RTPE_SAMPLE_SFD_DIR(jitter_measured, jitter, sfd, in);
+				RTPE_SAMPLE_SFD_DIR(jitter_measured, jitter_us, sfd, in);
 		}
 	}
 }

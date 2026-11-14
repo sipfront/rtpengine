@@ -824,7 +824,7 @@ stats_metric_q *statistics_gather_metrics(struct interface_sampled_rate_stats *i
 				atomic64_get_na(&lif->stats->s.packets_lost));
 		METRICs("jitter_average_ms", "%.6f",
 				atomic64_div(&lif->stats->sampled_in.sums.jitter_measured,
-					&lif->stats->sampled_in.counts.jitter_measured));
+					&lif->stats->sampled_in.counts.jitter_measured) / 1000.0);
 		METRICs("jitter_samples", "%" PRIu64,
 				atomic64_get_na(&lif->stats->sampled_in.counts.jitter_measured));
 		HEADER("}", NULL);
@@ -898,7 +898,7 @@ stats_metric_q *statistics_gather_metrics(struct interface_sampled_rate_stats *i
 						atomic64_get_na(&diff_in.packets));
 				METRICs("jitter_ms", "%.6f",
 						atomic64_div(&diff_in_sampled.sums.jitter_measured,
-							&diff_in_sampled.counts.jitter_measured));
+							&diff_in_sampled.counts.jitter_measured) / 1000.0);
 				METRICs("jitter_samples", "%" PRIu64,
 						atomic64_get_na(&diff_in_sampled.counts.jitter_measured));
 
