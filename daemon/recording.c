@@ -1074,6 +1074,10 @@ static void setup_media_proc(struct call_media *media) {
 
 
 static void dump_packet_proc(struct media_packet *mp, const str *s) {
+	// record-both is for the pcap method: a packet that is sent has no stream of its
+	// own here, and would be mixed into what the stream it goes out on received
+	if (mp->rec_sent && !rtpe_config.rec_egress)
+		return;
 	struct packet_stream *stream = mp->stream;
 	if (stream->recording.proc.stream_idx == UNINIT_IDX)
 		return;
