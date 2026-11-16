@@ -2325,13 +2325,30 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 
 	// A stream that goes to several outputs through a transcoder has a sequencer for each,
 	// and each of them counts the same gaps: only one of them is counted. Another one takes
-	// over when that one has not been given a packet for a second (its output is gone or
-	// blocked).
-	if (ssrc_in->lost_sequencer != seq && (!ssrc_in->lost_sequencer
-				|| mp->tv - ssrc_in->lost_sequencer_tv > LOSS_COUNTER_TAKEOVER_US))
-		ssrc_in->lost_sequencer = seq;
-	if (ssrc_in->lost_sequencer == seq)
-		ssrc_in->lost_sequencer_tv = mp->tv;
+	// over when that one's output is blocked (see handler_track_blocked_loss) or when it
+	// has not been given a packet for a second (its output is gone). The others keep what
+	// they have counted themselves until the counting one has been given the same packet,
+	// which is when it is covered: one that takes over then brings along exactly what
+	// nobody has counted yet. (A blocked output's sequencer gets the events of the stream
+	// only and has no say in any of this.)
+	if (!handler_media_blocked(mp)) {
+		if (ssrc_in->lost_sequencer != seq && (!ssrc_in->lost_sequencer
+					|| mp->tv - ssrc_in->lost_sequencer_tv > LOSS_COUNTER_TAKEOVER_US))
+			ssrc_in->lost_sequencer = seq;
+		if (ssrc_in->lost_sequencer == seq) {
+			ssrc_in->lost_sequencer_tv = mp->tv;
+			if (g_hash_table_size(ssrc_in->sequencers) > 1) {
+				GHashTableIter iter;
+				gpointer other;
+				g_hash_table_iter_init(&iter, ssrc_in->sequencers);
+				while (g_hash_table_iter_next(&iter, NULL, &other)) {
+					if (other != seq)
+						((packet_sequencer_t *) other)->lost_seen
+							= ((packet_sequencer_t *) other)->lost_count;
+				}
+			}
+		}
+	}
 
 	uint16_t seq_ori = (seq->seq < 0) ? 0 : seq->seq;
 	int seq_ret = packet_sequencer_insert(seq, &packet->p);
@@ -2443,13 +2460,25 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 		// (ssrc_in is locked here.)
 		uint32_t seq_new_lost = seq->lost_count > seq->lost_seen
 			? seq->lost_count - seq->lost_seen : 0;
-		seq->lost_seen = seq->lost_count;
-		if (seq_new_lost && !ssrc_in->lost_tracker_current && ssrc_in->lost_sequencer == seq) {
+		if (!seq_new_lost)
+			seq->lost_seen = seq->lost_count;
+		else if (ssrc_in->lost_tracker_current || handler_media_blocked(mp)) {
+			// the gap tracker's to count
+			seq->lost_seen = seq->lost_count;
+		}
+		else if (ssrc_in->lost_sequencer == seq) {
+			seq->lost_seen = seq->lost_count;
 			ssrc_in->packets_lost += seq_new_lost;
 			if (mp->sfd && mp->sfd->local_intf && mp->sfd->local_intf->stats)
 				atomic64_add_na(&mp->sfd->local_intf->stats->s.packets_lost, seq_new_lost);
 			RTPE_STATS_ADD(packets_lost, seq_new_lost);
 		}
+		else if (ssrc_in->lost_sequencer_tv == mp->tv) {
+			// the counting sequencer has had this packet already: covered
+			seq->lost_seen = seq->lost_count;
+		}
+		// (otherwise kept: dropped once the counting sequencer has been given this packet
+		// as well, or counted when this one takes over)
 		atomic_set_na(&ssrc_in->stats->ext_seq, seq->ext_seq);
 
 		ilogs(transcoding, LOG_DEBUG, "Processing RTP packet: seq %u, TS %lu",
@@ -5108,6 +5137,11 @@ static void handler_track_blocked_loss(struct media_packet *mp) {
 	uint32_t lost_diff;
 	{
 		LOCK(&ssrc->h.lock);
+		// if it is this output's sequencer whose loss is counted, another output's takes
+		// over with its next packet (see __handler_func_sequencer)
+		if (ssrc->lost_sequencer && ssrc->sequencers
+				&& g_hash_table_lookup(ssrc->sequencers, mp->media_out) == ssrc->lost_sequencer)
+			ssrc->lost_sequencer = NULL;
 		if (!ssrc->lost_tracker_current) {
 			ssrc->lost_tracker_current = true;
 			ssrc->last_seq_tracked = seq;

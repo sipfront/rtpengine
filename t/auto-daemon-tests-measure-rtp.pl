@@ -791,9 +791,10 @@ rtpe_req('delete', 'measure blocked media', { });
 # a stream that goes to several outputs is still one received stream: what it lost is
 # counted once, however many outputs it has and whichever of them go through a transcoder
 
-for my $case ('relayed and transcoded', 'two transcoded') {
+for my $case ('relayed and transcoded', 'two transcoded',
+		"two transcoded, the call's own blocked", 'two transcoded, the subscriber blocked') {
 
-my $tc_call = $case eq 'two transcoded';
+my $tc_call = $case ne 'relayed and transcoded';
 
 ($sock_a, $sock_b, $sock_c) =
 	new_call([qw(198.51.100.43 3110)], [qw(198.51.100.43 3112)], [qw(198.51.100.43 3114)]);
@@ -881,6 +882,8 @@ c=IN IP4 198.51.100.43
 a=recvonly
 SDP
 
+if ($case !~ /blocked$/) {
+
 rtpe_req('block media', "loss counted once - $case", { 'from-tag' => ft(), all => 'except-offer-answer', flags => ['directional'] });
 
 my $before = $intf_lost->();
@@ -893,6 +896,32 @@ rtpe_req('unblock media', "loss counted once - $case", { 'from-tag' => ft(), all
 $send->(1041, 1120, 1050, 1060, 1070);
 
 is $intf_lost->() - $before, 5, "$case: each lost packet is counted once";
+
+}
+else {
+
+# Both outputs have had media when one of them is blocked: whichever of the two it is, what
+# goes missing right after that is counted by the other one, and not again by the blocked one
+# when it comes back and finds a hole where it was blocked.
+my $which = $case =~ /subscriber/ ? 'except-offer-answer' : 'offer-answer';
+
+my $before = $intf_lost->();
+
+$send->(1000, 1020);
+
+rtpe_req('block media', "loss counted once - $case", { 'from-tag' => ft(), all => $which, flags => ['directional'] });
+
+$send->(1021, 1070, 1030, 1040, 1050);
+
+is $intf_lost->() - $before, 3, "$case: what is lost after that is counted";
+
+rtpe_req('unblock media', "loss counted once - $case", { 'from-tag' => ft(), all => $which, flags => ['directional'] });
+
+$send->(1071, 1110, 1080);
+
+is $intf_lost->() - $before, 4, "$case: and counted once when the output is back";
+
+}
 
 rtpe_req('delete', "loss counted once - $case", { });
 
