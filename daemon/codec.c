@@ -58,7 +58,6 @@ static void codec_store_add_raw_order(struct codec_store *cs, rtp_payload_type *
 static rtp_payload_type *codec_store_find_compatible(struct codec_store *cs,
 		const rtp_payload_type *pt);
 static void __rtp_payload_type_add_name(codec_names_ht, rtp_payload_type *pt);
-static void codec_track_lost(struct media_packet *mp);
 static uint32_t __codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq);
 static void __codec_options_set(call_t *call, rtp_payload_type *pt, str_case_value_ht codec_set);
 
@@ -2188,17 +2187,7 @@ static bool handler_silence_block(struct codec_handler *h, struct media_packet *
 	}
 	return true;
 }
-// Measures what was received (jitter, sequence gaps) for a packet that is not transcoded.
-// Must run before the media-blocking check: blocked media is still received, and a stream
-// we terminate ourselves (block-media plus play-media) is otherwise never measured at all.
-static void handler_measure_ingress(struct codec_handler *h, struct media_packet *mp) {
-	codec_calc_jitter(mp->ssrc_in, ntohl(mp->rtp->timestamp), h->source_pt.clock_rate, mp->tv);
-	codec_track_lost(mp);
-}
 static int handler_func_passthrough(struct codec_handler *h, struct media_packet *mp) {
-	if (mp->rtp)
-		handler_measure_ingress(h, mp);
-
 	if (!handler_silence_block(h, mp))
 		return 0;
 
@@ -2411,7 +2400,7 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 			goto next;
 		}
 
-		// (What the stream lost is not taken from the sequencer's count: see codec_track_lost.)
+		// (What the stream lost is not taken from the sequencer's count: see codec_measure_ingress.)
 		atomic_set_na(&ssrc_in->stats->ext_seq, seq->ext_seq);
 
 		ilogs(transcoding, LOG_DEBUG, "Processing RTP packet: seq %u, TS %lu",
@@ -2840,9 +2829,6 @@ static int __handler_func_supplemental(struct codec_handler *h, struct media_pac
 
 	assert((mp->rtp->m_pt & 0x7f) == h->source_pt.payload_type);
 
-	// (an event shares the sequence numbers of the audio around it)
-	codec_track_lost(mp);
-
 	// create new packet and insert it into sequencer queue
 
 	ilogs(transcoding, LOG_DEBUG, "Received %s supplemental RTP packet: SSRC %" PRIx32
@@ -3053,8 +3039,6 @@ static int handler_func_passthrough_stub(struct codec_handler *h, struct media_p
 static int handler_func_passthrough_ssrc(struct codec_handler *h, struct media_packet *mp) {
 	if (G_UNLIKELY(!mp->rtp))
 		return handler_func_passthrough(h, mp);
-
-	handler_measure_ingress(h, mp);
 
 	if (!handler_silence_block(h, mp))
 		return 0;
@@ -4963,13 +4947,6 @@ void codec_calc_jitter(struct ssrc_entry_call *ssrc, unsigned long ts, unsigned 
 	uint32_t transit = (uint32_t) ((uint64_t) (tv / 1000000) * clockrate
 			+ (uint64_t) (tv % 1000000) * clockrate / 1000000) - ts;
 	LOCK(&ssrc->h.lock);
-	// A packet that goes to several outputs comes here once for each of them: it is one
-	// sample. (Taken again it would count as a packet without any jitter, and the estimate
-	// would sink with the number of outputs.)
-	if (ssrc->jitter_tv == tv && ssrc->jitter_ts == (uint32_t) ts && ssrc->transit)
-		return;
-	ssrc->jitter_tv = tv;
-	ssrc->jitter_ts = ts;
 	int32_t d = 0;
 	if (ssrc->transit)
 		d = transit - ssrc->transit;
@@ -4980,30 +4957,43 @@ void codec_calc_jitter(struct ssrc_entry_call *ssrc, unsigned long ts, unsigned 
 	if (d < 100000)
 		ssrc->jitter += d - ((ssrc->jitter + 8) >> 4);
 }
-// What a received stream lost is counted in one place, the gap tracker of its SSRC, and by
-// nothing else: every sequence number that is missing from the stream counts once, however
-// many outputs the stream goes to, whether these relay it as it is, transcode it or are
-// blocked, and whichever of them come and go. Every handler that is given a received RTP
-// packet hands it in here before it does anything else with it; the tracker ignores a
-// sequence number it has already seen, so that a packet which goes to several outputs is
-// one packet. (The sequencers in front of the transcoders keep a loss count of their own,
-// one per output and only of what that output is given: it is not used for this.)
+// What is received is measured in one place: here, once for every RTP packet that comes in,
+// before it is handed to any of the outputs of its stream (see stream_packet). Every sequence
+// number missing from the stream counts as lost once, and every packet is one sample of the
+// jitter, however many outputs the stream goes to (none at all included), whether these
+// relay it as it is, transcode it or are blocked, and whichever of them come and go.
+// (The sequencers in front of the transcoders keep a loss count of their own, one per
+// output and only of what that output is given: it is not used for this.)
 // A packet counts as lost when it has not come by the time the stream is 32 packets past
 // it; what arrives late or out of order within that is not lost.
-static void codec_track_lost(struct media_packet *mp) {
+void codec_measure_ingress(struct media_packet *mp, int payload_type) {
 	struct ssrc_entry_call *ssrc = mp->ssrc_in;
 	if (!ssrc || !mp->rtp)
 		return;
+
 	uint32_t lost_diff;
 	{
 		LOCK(&ssrc->h.lock);
 		lost_diff = __codec_calc_lost(ssrc, ntohs(mp->rtp->seq_num));
 	}
-	if (!lost_diff)
+	if (lost_diff) {
+		if (mp->sfd && mp->sfd->local_intf && mp->sfd->local_intf->stats)
+			atomic64_add_na(&mp->sfd->local_intf->stats->s.packets_lost, lost_diff);
+		RTPE_STATS_ADD(packets_lost, lost_diff);
+	}
+
+	// Jitter is measured on the clock of the codec the packet came in with. The packets
+	// of a telephone event (or other supplemental codec) are left out: they repeat one
+	// timestamp while time goes on, which is no jitter, and the audio after them compares
+	// to the audio before them as if they had not been there.
+	if (!mp->media)
 		return;
-	if (mp->sfd && mp->sfd->local_intf && mp->sfd->local_intf->stats)
-		atomic64_add_na(&mp->sfd->local_intf->stats->s.packets_lost, lost_diff);
-	RTPE_STATS_ADD(packets_lost, lost_diff);
+	const rtp_payload_type *pt = get_rtp_payload_type(payload_type, &mp->media->codecs);
+	if (!pt || !pt->clock_rate)
+		return;
+	if (pt->codec_def && pt->codec_def->supplemental)
+		return;
+	codec_calc_jitter(ssrc, ntohl(mp->rtp->timestamp), pt->clock_rate, mp->tv);
 }
 // ssrc is locked
 static uint32_t __codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq) {
@@ -5076,20 +5066,11 @@ static uint32_t __codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq) {
 #ifdef WITH_TRANSCODING
 
 
-static void handler_measure_blocked_transcode(struct codec_handler *h, struct media_packet *mp) {
-	struct codec_handler *ih = h->source_pt.codec_def->supplemental
-		? __input_handler(h, mp) : h;
-	codec_calc_jitter(mp->ssrc_in, ntohl(mp->rtp->timestamp), ih->source_pt.clock_rate, mp->tv);
-}
 static int handler_func_transcode(struct codec_handler *h, struct media_packet *mp) {
 	if (G_UNLIKELY(!mp->rtp))
 		return handler_func_passthrough(h, mp);
-	codec_track_lost(mp);
-	if (!handler_silence_block(h, mp)) {
-		// blocked media is still received: measured, then dropped
-		handler_measure_blocked_transcode(h, mp);
+	if (!handler_silence_block(h, mp))
 		return 0;
-	}
 
 	// use main codec handler for supp codecs
 	if (h->source_pt.codec_def->supplemental) {
@@ -5104,9 +5085,6 @@ static int handler_func_transcode(struct codec_handler *h, struct media_packet *
 	ilogs(transcoding, LOG_DEBUG, "Received RTP packet: SSRC %" PRIx32 ", PT %u, seq %u, TS %u, len %zu",
 			ntohl(mp->rtp->ssrc), mp->rtp->m_pt, ntohs(mp->rtp->seq_num),
 			ntohl(mp->rtp->timestamp), mp->payload.len);
-
-	codec_calc_jitter(mp->ssrc_in, ntohl(mp->rtp->timestamp), h->input_handler->source_pt.clock_rate,
-			mp->tv);
 
 	if (h->stats_entry) {
 		int now_sec = rtpe_now / 1000000;

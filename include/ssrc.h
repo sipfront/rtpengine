@@ -109,8 +109,6 @@ struct ssrc_entry_call {
 	packet_sequencer_t *sequencer_cache; // to skip hash lookup
 	struct call_media *media_cache; // to skip hash lookup
 	uint32_t jitter, transit;
-	int64_t jitter_tv; // the packet last taken into the jitter estimate: its arrival
-	uint32_t jitter_ts; // and its timestamp
 	// output only
 	uint16_t seq_diff;
 };

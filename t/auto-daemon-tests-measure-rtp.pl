@@ -795,8 +795,9 @@ rtpe_req('delete', 'measure blocked media', { });
 # packets that were left out, exactly.
 
 sub loss_case {
-	my ($name, $tc_call, $steps) = @_;
+	my ($name, $tc_call, $steps, $mode) = @_;
 	$name = "loss counted once - $name";
+	$mode //= '';
 
 	my ($s_a, $s_b, $s_c) =
 		new_call([qw(198.51.100.43 3110)], [qw(198.51.100.43 3112)], [qw(198.51.100.43 3114)]);
@@ -806,7 +807,32 @@ sub loss_case {
 		: "m=audio PORT RTP/AVP 0\nc=IN IP4 203.0.113.1\na=rtpmap:0 PCMU/8000\n";
 	my $answer_pt = $tc_call ? 8 : 0;
 
-	offer($name, { $tc_call ? (codec => { transcode => ['PCMA'] }) : () }, <<SDP);
+	my $p_b;
+	if ($mode eq 'publish') {
+	# a published stream: it has no output at all until somebody subscribes to it
+	($p_b) = publish($name, { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+c=IN IP4 198.51.100.43
+t=0 0
+m=audio 3110 RTP/AVP 0
+a=sendonly
+-----------------------------------------
+v=0
+o=- SDP_VERSION IN IP4 203.0.113.1
+s=RTPE_VERSION
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=recvonly
+a=rtcp:PORT
+SDP
+	}
+	else {
+	offer($name, { $tc_call ? (codec => { transcode => ['PCMA'] }) : (),
+			$mode eq 'blackhole' ? ('media echo' => 'blackhole') : () }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.43
 s=tester
@@ -822,7 +848,7 @@ ${offer_out}a=sendrecv
 a=rtcp:PORT
 SDP
 
-	my ($p_b) = answer($name, { }, <<SDP);
+	($p_b) = answer($name, { }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.43
 s=tester
@@ -840,6 +866,8 @@ a=rtpmap:0 PCMU/8000
 a=sendrecv
 a=rtcp:PORT
 SDP
+
+	}
 
 	my $intf_lost = sub {
 		my $r = rtpe_req('statistics', "$name stats", { });
@@ -997,6 +1025,175 @@ loss_case('transcoded plus a relayed subscriber, blocked, unblocked, then the re
 	$c->{send}->(40, 1, 20);
 	Time::HiRes::sleep(1.2);
 	$c->{send}->(20, 5);
+});
+
+# a published stream is received whether anybody is subscribed to it or not: what comes in
+# while it has no output is neither missed nor taken for lost when a subscriber comes back
+for my $tc_sub (0, 1) {
+	loss_case('published, the ' . ($tc_sub ? 'transcoded' : 'relayed') . ' subscriber leaves and comes back', 0, sub {
+		my ($c) = @_;
+		$c->{send}->(40, 10, 38);
+		$c->{subscribe}->($tc_sub);
+		$c->{send}->(40, 1, 38);
+		$c->{unsubscribe}->();
+		$c->{send}->(40, 1, 20, 38);
+		$c->{subscribe}->($tc_sub);
+		$c->{send}->(40, 1);
+	}, 'publish');
+}
+
+# ... and so is one that is received only to be thrown away
+loss_case('thrown away', 0, sub {
+	my ($c) = @_;
+	$c->{send}->(40, 10, 38);
+	$c->{send}->(40, 1, 20);
+}, 'blackhole');
+
+
+# Jitter: every received packet is one sample of it.
+
+sub jitter_case {
+	my ($name, $steps) = @_;
+	$name = "jitter - $name";
+
+	my ($s_a, $s_b) = new_call([qw(198.51.100.43 3130)], [qw(198.51.100.43 3132)]);
+
+	offer($name, { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+c=IN IP4 198.51.100.43
+t=0 0
+m=audio 3130 RTP/AVP 0 101
+a=rtpmap:101 telephone-event/8000
+-----------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0 101
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:101 telephone-event/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+	my ($p_b) = answer($name, { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+c=IN IP4 198.51.100.43
+t=0 0
+m=audio 3132 RTP/AVP 0 101
+a=rtpmap:101 telephone-event/8000
+-----------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0 101
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:101 telephone-event/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+	# (the last sample of the stream before this one is taken first: the interface's
+	# figures are of all its streams)
+	Time::HiRes::sleep(1.2);
+
+	my %c;
+	my ($seq, $ts, $last) = (1000, 3000, Time::HiRes::time());
+	# One packet now. Its timestamp is that many packets of 20 ms after the one before
+	# (none: the same timestamp again), or 'now': as much later as it really is since the
+	# timestamp last moved on.
+	$c{snd} = sub {
+		my ($pt, $payload, $steps) = @_;
+		$steps //= 1;
+		my $now = Time::HiRes::time();
+		$ts += $steps eq 'now' ? int(($now - $last) * 8000) : 160 * $steps;
+		$last = $now if $steps; # (when the timestamp last moved on)
+		snd($s_a, $p_b, rtp($pt, $seq++, $ts, 0x234567b, $payload));
+	};
+	# what the samples taken over the next good second average to, in ms
+	# (they are taken by the once-per-second call timer)
+	$c{sampled} = sub {
+		my $get = sub {
+			my $r = rtpe_req('statistics', "$name stats", { });
+			my ($intf) = grep { $_->{address} eq '203.0.113.1' } @{$r->{statistics}{interfaces}};
+			return $intf->{ingress};
+		};
+		my $before = $get->();
+		$_[0]->();
+		Time::HiRes::sleep(1.2);
+		my $after = $get->();
+		my $n = $after->{jitter_samples} - $before->{jitter_samples};
+		cmp_ok $n, '>=', 1, "$name: sampled";
+		return ($after->{jitter_average_ms} * $after->{jitter_samples}
+				- $before->{jitter_average_ms} * $before->{jitter_samples}) / ($n || 1);
+	};
+	# a second of packets 10 and 30 ms apart in turn: 10 ms of jitter on each
+	$c{jittery} = sub {
+		for my $i (1 .. 50) {
+			$c{snd}->(0, "\x00" x 160);
+			Time::HiRes::usleep($i % 2 ? 10000 : 30000);
+		}
+	};
+
+	$steps->(\%c);
+
+	rtpe_req('delete', $name, { });
+}
+
+# packets that share a timestamp and come in together (the packets of one video frame) are
+# samples like any other: with them the estimate comes down, as nothing about them jitters
+jitter_case('packets with one timestamp', sub {
+	my ($c) = @_;
+	my $j = $c->{sampled}->($c->{jittery});
+	cmp_ok $j, '>=', 5, 'jitter - packets with one timestamp: there is jitter before them';
+	diag("jitter before the packets with one timestamp: $j ms");
+	$j = $c->{sampled}->(sub {
+		$c->{snd}->(0, "\x00" x 160, 'now');
+		for (1 .. 80) {
+			# (one after the other, just not faster than they are taken)
+			Time::HiRes::usleep(300);
+			$c->{snd}->(0, "\x00" x 160, 0);
+		}
+	});
+	cmp_ok $j, '<=', 3, 'jitter - packets with one timestamp: and next to none after them';
+	diag("jitter after 80 packets with one timestamp: $j ms");
+});
+
+# the packets of a telephone event repeat one timestamp while time goes on: that is no jitter
+jitter_case('a telephone event', sub {
+	my ($c) = @_;
+	my $j = $c->{sampled}->(sub {
+		for (1 .. 50) {
+			$c->{snd}->(0, "\x00" x 160);
+			Time::HiRes::usleep(20000);
+		}
+	});
+	# (what a steady stream measures here is how exactly this test sleeps: a few ms)
+	cmp_ok $j, '<=', 6, 'jitter - a telephone event: a steady stream has little';
+	diag("jitter of a steady stream: $j ms");
+	$j = $c->{sampled}->(sub {
+		$c->{snd}->(0, "\x00" x 160, 'now');
+		Time::HiRes::usleep(20000);
+		$c->{snd}->(101, "\x05\x0a\x00\xa0");
+		for my $i (2 .. 25) {
+			Time::HiRes::usleep(20000);
+			$c->{snd}->(101, "\x05\x0a" . pack('n', 160 * $i), 0);
+		}
+		for my $i (1 .. 3) {
+			Time::HiRes::usleep(20000);
+			$c->{snd}->(0, "\x00" x 160, $i == 1 ? 'now' : 1);
+		}
+	});
+	# (25 packets taken as 20 ms late each would be some 15 ms of it)
+	cmp_ok $j, '<=', 6, 'jitter - a telephone event: and no more with an event in it';
+	diag("jitter of a steady stream with a telephone event: $j ms");
 });
 
 
