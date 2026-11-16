@@ -788,23 +788,25 @@ rtpe_req('delete', 'measure blocked media', { });
 }
 
 
-# a stream that goes to several outputs is still one received stream: what it lost is
-# counted once, however many outputs it has and whichever of them go through a transcoder
+# What a received stream lost is counted once: every sequence number that is missing from
+# it, whatever the stream's outputs are (relayed as it is, behind a transcoder, blocked) and
+# whichever of them come and go while it runs. Each case below is one such stream: packets
+# go missing before and right after every change, and in the end the count is the number of
+# packets that were left out, exactly.
 
-for my $case ('relayed and transcoded', 'two transcoded',
-		"two transcoded, the call's own blocked", 'two transcoded, the subscriber blocked') {
+sub loss_case {
+	my ($name, $tc_call, $steps) = @_;
+	$name = "loss counted once - $name";
 
-my $tc_call = $case ne 'relayed and transcoded';
+	my ($s_a, $s_b, $s_c) =
+		new_call([qw(198.51.100.43 3110)], [qw(198.51.100.43 3112)], [qw(198.51.100.43 3114)]);
 
-($sock_a, $sock_b, $sock_c) =
-	new_call([qw(198.51.100.43 3110)], [qw(198.51.100.43 3112)], [qw(198.51.100.43 3114)]);
+	my $offer_out = $tc_call
+		? "m=audio PORT RTP/AVP 0 8\nc=IN IP4 203.0.113.1\na=rtpmap:0 PCMU/8000\na=rtpmap:8 PCMA/8000\n"
+		: "m=audio PORT RTP/AVP 0\nc=IN IP4 203.0.113.1\na=rtpmap:0 PCMU/8000\n";
+	my $answer_pt = $tc_call ? 8 : 0;
 
-my $offer_out = $tc_call
-	? "m=audio PORT RTP/AVP 0 8\nc=IN IP4 203.0.113.1\na=rtpmap:0 PCMU/8000\na=rtpmap:8 PCMA/8000\n"
-	: "m=audio PORT RTP/AVP 0\nc=IN IP4 203.0.113.1\na=rtpmap:0 PCMU/8000\n";
-my $answer_pt = $tc_call ? 8 : 0;
-
-($port_a) = offer("loss counted once - $case", { $tc_call ? (codec => { transcode => ['PCMA'] }) : () }, <<SDP);
+	offer($name, { $tc_call ? (codec => { transcode => ['PCMA'] }) : () }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.43
 s=tester
@@ -820,7 +822,7 @@ ${offer_out}a=sendrecv
 a=rtcp:PORT
 SDP
 
-($port_b) = answer("loss counted once - $case", { }, <<SDP);
+	my ($p_b) = answer($name, { }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.43
 s=tester
@@ -839,201 +841,163 @@ a=sendrecv
 a=rtcp:PORT
 SDP
 
-my $intf_lost = sub {
-	my $r = rtpe_req('statistics', "loss counted once - $case stats", { });
-	my ($intf) = grep { $_->{address} eq '203.0.113.1' } @{$r->{statistics}{interfaces}};
-	return $intf->{ingress}{packets_lost};
-};
-# sends the sequence numbers $from .. $to without those in @missing
-my $send = sub {
-	my ($from, $to, @missing) = @_;
-	for my $n ($from .. $to) {
-		next if grep { $_ == $n } @missing;
-		snd($sock_a, $port_b, rtp(0, $n, 3000 + 160 * ($n - 1000), 0x2345679, "\x00" x 160));
-		Time::HiRes::usleep(2000);
-	}
-};
+	my $intf_lost = sub {
+		my $r = rtpe_req('statistics', "$name stats", { });
+		my ($intf) = grep { $_->{address} eq '203.0.113.1' } @{$r->{statistics}{interfaces}};
+		return $intf->{ingress}{packets_lost};
+	};
+	my $before = $intf_lost->();
 
-# the second output is a subscriber behind a transcoder. It is blocked at first, so that it
-# starts counting only after the first output has already seen packets go missing.
-my ($ftr, $ttr, $port_c);
-($ftr, $ttr, undef, undef, undef, $port_c) = subscribe_request("loss counted once - $case",
-	{ 'from-tag' => ft(), codec => { transcode => ['PCMA'] } }, <<SDP);
+	my ($seq, $missing, $sub_tag) = (1000, 0);
+	my %c;
+	# the next $n sequence numbers, without those at the given places among them
+	$c{send} = sub {
+		my ($n, @drop) = @_;
+		my %drop = map { $_ => 1 } @drop;
+		for my $i (0 .. $n - 1) {
+			if ($drop{$i}) {
+				$missing++;
+			}
+			else {
+				snd($s_a, $p_b, rtp(0, ($seq + $i) & 0xffff, 3000 + 160 * ($seq + $i - 1000),
+						0x2345679, "\x00" x 160));
+				Time::HiRes::usleep(1500);
+			}
+		}
+		$seq += $n;
+	};
+	# a second output: a subscriber the stream is relayed to as it is, or one behind a transcoder
+	$c{subscribe} = sub {
+		my ($transcoded) = @_;
+		my $sdp_out = $transcoded
+			? "m=audio PORT RTP/AVP 0 8\nc=IN IP4 203.0.113.1\na=rtpmap:0 PCMU/8000\na=rtpmap:8 PCMA/8000\n"
+			: "m=audio PORT RTP/AVP 0\nc=IN IP4 203.0.113.1\na=rtpmap:0 PCMU/8000\n";
+		my $sub_pt = $transcoded ? 8 : 0;
+		(undef, $sub_tag) = subscribe_request($name,
+			{ 'from-tag' => ft(), $transcoded ? (codec => { transcode => ['PCMA'] }) : () }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.43
 s=tester
 t=0 0
-m=audio PORT RTP/AVP 0 8
-c=IN IP4 203.0.113.1
-a=rtpmap:0 PCMU/8000
-a=rtpmap:8 PCMA/8000
-a=sendonly
+${sdp_out}a=sendonly
 a=rtcp:PORT
 SDP
-
-subscribe_answer("loss counted once - $case",
-	{ 'from-tag' => ft(), 'to-tag' => $ttr, flags => ['allow transcoding'] }, <<SDP);
+		subscribe_answer($name, { 'from-tag' => ft(), 'to-tag' => $sub_tag,
+				$transcoded ? (flags => ['allow transcoding']) : () }, <<SDP);
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.43
 s=tester
 t=0 0
-m=audio 3114 RTP/AVP 8
+m=audio 3114 RTP/AVP $sub_pt
 c=IN IP4 198.51.100.43
 a=recvonly
 SDP
+	};
+	$c{unsubscribe} = sub {
+		rtpe_req('unsubscribe', $name, { 'from-tag' => ft(), 'to-tag' => $sub_tag });
+	};
+	# 'call': the call's own output, 'subscriber': the second one, 'all': the stream as a whole
+	my $which = sub {
+		my ($what) = @_;
+		return { } if $what eq 'all';
+		return { 'from-tag' => ft(), flags => ['directional'],
+			all => $what eq 'call' ? 'offer-answer' : 'except-offer-answer' };
+	};
+	$c{block} = sub { rtpe_req('block media', $name, $which->($_[0])) };
+	$c{unblock} = sub { rtpe_req('unblock media', $name, $which->($_[0])) };
 
-if ($case !~ /blocked$/) {
+	$steps->(\%c);
 
-rtpe_req('block media', "loss counted once - $case", { 'from-tag' => ft(), all => 'except-offer-answer', flags => ['directional'] });
+	# (a packet counts as lost once the stream is 32 packets past it)
+	$c{send}->(40);
 
-my $before = $intf_lost->();
+	is $intf_lost->() - $before, $missing, "$name: each of the $missing lost packets is counted once";
 
-$send->(1000, 1040, 1010, 1020);
-
-rtpe_req('unblock media', "loss counted once - $case", { 'from-tag' => ft(), all => 'except-offer-answer', flags => ['directional'] });
-
-# (the last gap is far enough from the end to have left the 32-packet window)
-$send->(1041, 1120, 1050, 1060, 1070);
-
-is $intf_lost->() - $before, 5, "$case: each lost packet is counted once";
-
-}
-else {
-
-# Both outputs have had media when one of them is blocked: whichever of the two it is, what
-# goes missing right after that is counted by the other one, and not again by the blocked one
-# when it comes back and finds a hole where it was blocked.
-my $which = $case =~ /subscriber/ ? 'except-offer-answer' : 'offer-answer';
-
-my $before = $intf_lost->();
-
-$send->(1000, 1020);
-
-rtpe_req('block media', "loss counted once - $case", { 'from-tag' => ft(), all => $which, flags => ['directional'] });
-
-$send->(1021, 1070, 1030, 1040, 1050);
-
-is $intf_lost->() - $before, 3, "$case: what is lost after that is counted";
-
-rtpe_req('unblock media', "loss counted once - $case", { 'from-tag' => ft(), all => $which, flags => ['directional'] });
-
-$send->(1071, 1110, 1080);
-
-is $intf_lost->() - $before, 4, "$case: and counted once when the output is back";
-
+	rtpe_req('delete', $name, { });
 }
 
-rtpe_req('delete', "loss counted once - $case", { });
-
+# one output, relayed or transcoded: single packets, and more in a row than the window holds
+for my $tc (0, 1) {
+	my $how = $tc ? 'transcoded' : 'relayed';
+	loss_case("$how, a burst", $tc, sub {
+		my ($c) = @_;
+		$c->{send}->(40, 10, 20);
+		$c->{send}->(100, 20 .. 69);
+		$c->{send}->(20, 5);
+	});
+	# blocked and unblocked again, with packets missing right before and after either
+	loss_case("$how, blocked and unblocked", $tc, sub {
+		my ($c) = @_;
+		$c->{send}->(40, 10, 37);
+		$c->{block}->('all');
+		$c->{send}->(40, 2, 20, 38);
+		$c->{unblock}->('all');
+		$c->{send}->(40, 1, 20);
+	});
+	# nothing for more than a second, then on: nobody takes anything over, nothing is lost
+	loss_case("$how, a pause", $tc, sub {
+		my ($c) = @_;
+		$c->{send}->(40, 10, 38);
+		Time::HiRes::sleep(1.2);
+		$c->{send}->(40, 1);
+	});
 }
 
-
-# ... and when the output that is relayed as it is goes away while a transcoded one stays:
-# what the two had not counted yet between them is counted by the one that is left
-
-{
-
-($sock_a, $sock_b, $sock_c) =
-	new_call([qw(198.51.100.43 3120)], [qw(198.51.100.43 3122)], [qw(198.51.100.43 3124)]);
-
-($port_a) = offer('loss counted once - relayed one leaves', { codec => { transcode => ['PCMA'] } }, <<SDP);
-v=0
-o=- 1545997027 1 IN IP4 198.51.100.43
-s=tester
-c=IN IP4 198.51.100.43
-t=0 0
-m=audio 3120 RTP/AVP 0
------------------------------------------
-v=0
-o=- 1545997027 1 IN IP4 198.51.100.43
-s=tester
-t=0 0
-m=audio PORT RTP/AVP 0 8
-c=IN IP4 203.0.113.1
-a=rtpmap:0 PCMU/8000
-a=rtpmap:8 PCMA/8000
-a=sendrecv
-a=rtcp:PORT
-SDP
-
-($port_b) = answer('loss counted once - relayed one leaves', { }, <<SDP);
-v=0
-o=- 1545997027 1 IN IP4 198.51.100.43
-s=tester
-c=IN IP4 198.51.100.43
-t=0 0
-m=audio 3122 RTP/AVP 8
------------------------------------------
-v=0
-o=- 1545997027 1 IN IP4 198.51.100.43
-s=tester
-t=0 0
-m=audio PORT RTP/AVP 0
-c=IN IP4 203.0.113.1
-a=rtpmap:0 PCMU/8000
-a=sendrecv
-a=rtcp:PORT
-SDP
-
-my ($ftr, $ttr, $port_c);
-($ftr, $ttr, undef, undef, undef, $port_c) = subscribe_request('loss counted once - relayed one leaves',
-	{ 'from-tag' => ft() }, <<SDP);
-v=0
-o=- 1545997027 1 IN IP4 198.51.100.43
-s=tester
-t=0 0
-m=audio PORT RTP/AVP 0
-c=IN IP4 203.0.113.1
-a=rtpmap:0 PCMU/8000
-a=sendonly
-a=rtcp:PORT
-SDP
-
-subscribe_answer('loss counted once - relayed one leaves',
-	{ 'from-tag' => ft(), 'to-tag' => $ttr }, <<SDP);
-v=0
-o=- 1545997027 1 IN IP4 198.51.100.43
-s=tester
-t=0 0
-m=audio 3124 RTP/AVP 0
-c=IN IP4 198.51.100.43
-a=recvonly
-SDP
-
-my $intf_lost = sub {
-	my $r = rtpe_req('statistics', 'loss counted once - relayed one leaves stats', { });
-	my ($intf) = grep { $_->{address} eq '203.0.113.1' } @{$r->{statistics}{interfaces}};
-	return $intf->{ingress}{packets_lost};
-};
-my $send = sub {
-	my ($from, $to, @missing) = @_;
-	for my $n ($from .. $to) {
-		next if grep { $_ == $n } @missing;
-		snd($sock_a, $port_b, rtp(0, $n, 3000 + 160 * ($n - 1000), 0x234567a, "\x00" x 160));
-		Time::HiRes::usleep(2000);
+# a second output comes in while the stream runs, and leaves again: every combination of
+# relayed and transcoded
+for my $tc_call (0, 1) {
+	for my $tc_sub (0, 1) {
+		my $how = ($tc_call ? 'transcoded' : 'relayed') . ' plus a ' . ($tc_sub ? 'transcoded' : 'relayed') . ' subscriber';
+		loss_case("$how, subscribed and unsubscribed", $tc_call, sub {
+			my ($c) = @_;
+			$c->{send}->(40, 10, 38);
+			$c->{subscribe}->($tc_sub);
+			$c->{send}->(40, 1, 20, 38);
+			$c->{unsubscribe}->();
+			$c->{send}->(40, 1, 20);
+		});
+		# either of the two blocked while the other goes on, and unblocked again
+		for my $blocked ('call', 'subscriber') {
+			loss_case("$how, the $blocked blocked and unblocked", $tc_call, sub {
+				my ($c) = @_;
+				$c->{subscribe}->($tc_sub);
+				$c->{send}->(40, 10, 38);
+				$c->{block}->($blocked);
+				$c->{send}->(40, 1, 20, 38);
+				$c->{unblock}->($blocked);
+				$c->{send}->(40, 1, 20);
+			});
+		}
 	}
-};
-
-my $before = $intf_lost->();
-
-# one packet missing early enough to have been counted while both outputs are there, one
-# so late that it has not been yet
-$send->(1000, 1080, 1010, 1070);
-is $intf_lost->() - $before, 1, 'relayed one leaves: counted so far';
-
-rtpe_req('unsubscribe', 'loss counted once - relayed one leaves', { 'from-tag' => ft(), 'to-tag' => $ttr });
-
-# and one right after it has left
-$send->(1081, 1110, 1090);
-# (the output that is left takes over once nothing has been relayed for a second)
-Time::HiRes::sleep(1.2);
-$send->(1111, 1120);
-
-is $intf_lost->() - $before, 3, 'relayed one leaves: each lost packet is counted once';
-
-rtpe_req('delete', 'loss counted once - relayed one leaves', { });
-
 }
+
+# the output the stream is relayed to leaves while a transcoded one stays, and in the second
+# after that more packets go missing, one by one, than the window holds
+loss_case('transcoded plus a relayed subscriber, many lost right after it leaves', 1, sub {
+	my ($c) = @_;
+	$c->{subscribe}->(0);
+	$c->{send}->(40, 10, 38);
+	$c->{unsubscribe}->();
+	$c->{send}->(80, map { 2 * $_ + 1 } 0 .. 39);
+	Time::HiRes::sleep(1.2);
+	$c->{send}->(20, 5);
+});
+
+# the transcoded output is blocked and unblocked while the stream is also relayed, and then
+# the one it is relayed to leaves: the stretch that was blocked is not taken for lost
+loss_case('transcoded plus a relayed subscriber, blocked, unblocked, then the relayed one leaves', 1, sub {
+	my ($c) = @_;
+	$c->{subscribe}->(0);
+	$c->{send}->(40, 10);
+	$c->{block}->('call');
+	$c->{send}->(20, 5);
+	$c->{unblock}->('call');
+	$c->{send}->(10, 8);
+	$c->{unsubscribe}->();
+	$c->{send}->(40, 1, 20);
+	Time::HiRes::sleep(1.2);
+	$c->{send}->(20, 5);
+});
 
 
 

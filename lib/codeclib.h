@@ -375,7 +375,6 @@ struct seq_packet_s {
 struct packet_sequencer_s {
 	GTree *packets;
 	unsigned int lost_count;
-	unsigned int lost_seen; // lost_count as its user last looked at it
 	int seq; // next expected
 	unsigned int ext_seq; // last received
 	int roc; // rollover counter XXX duplicate with SRTP encryption context
