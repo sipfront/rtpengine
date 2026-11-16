@@ -95,10 +95,7 @@ struct ssrc_entry_call {
 	uint32_t last_seq_tracked;
 	uint32_t lost_bits; // sliding bitfield, [0] = ext_seq
 	uint32_t packets_lost; // locally measured (sequence-gap based) cumulative packets lost
-	bool lost_tracker_current; // last_seq_tracked/lost_bits follow the stream (no sequencer counted since)
-	int64_t lost_relay_tv; // arrival of the last packet the gap tracker saw on its way to a sink it is relayed to as it is
-	packet_sequencer_t *lost_sequencer; // of the sequencers (one per output) the one whose loss is counted; never dereferenced
-	int64_t lost_sequencer_tv; // arrival of the last packet it was given
+	bool lost_tracker_started; // last_seq_tracked/lost_bits follow the stream: its first packet has been seen
 	uint32_t packets_lost_rtcp; // RTCP cumulative number of packets lost (RR)
 	int32_t directional_packets_lost_rtcp; // last signed RTCP cumulative loss used for directional metrics
 	int64_t directional_packets_lost_rtcp_reported_us; // timestamp of the last directional loss sample
