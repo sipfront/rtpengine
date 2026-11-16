@@ -788,6 +788,117 @@ rtpe_req('delete', 'measure blocked media', { });
 }
 
 
+# a stream that goes to several outputs is still one received stream: what it lost is
+# counted once, however many outputs it has and whichever of them go through a transcoder
+
+for my $case ('relayed and transcoded', 'two transcoded') {
+
+my $tc_call = $case eq 'two transcoded';
+
+($sock_a, $sock_b, $sock_c) =
+	new_call([qw(198.51.100.43 3110)], [qw(198.51.100.43 3112)], [qw(198.51.100.43 3114)]);
+
+my $offer_out = $tc_call
+	? "m=audio PORT RTP/AVP 0 8\nc=IN IP4 203.0.113.1\na=rtpmap:0 PCMU/8000\na=rtpmap:8 PCMA/8000\n"
+	: "m=audio PORT RTP/AVP 0\nc=IN IP4 203.0.113.1\na=rtpmap:0 PCMU/8000\n";
+my $answer_pt = $tc_call ? 8 : 0;
+
+($port_a) = offer("loss counted once - $case", { $tc_call ? (codec => { transcode => ['PCMA'] }) : () }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+c=IN IP4 198.51.100.43
+t=0 0
+m=audio 3110 RTP/AVP 0
+-----------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+t=0 0
+${offer_out}a=sendrecv
+a=rtcp:PORT
+SDP
+
+($port_b) = answer("loss counted once - $case", { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+c=IN IP4 198.51.100.43
+t=0 0
+m=audio 3112 RTP/AVP $answer_pt
+-----------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+my $intf_lost = sub {
+	my $r = rtpe_req('statistics', "loss counted once - $case stats", { });
+	my ($intf) = grep { $_->{address} eq '203.0.113.1' } @{$r->{statistics}{interfaces}};
+	return $intf->{ingress}{packets_lost};
+};
+# sends the sequence numbers $from .. $to without those in @missing
+my $send = sub {
+	my ($from, $to, @missing) = @_;
+	for my $n ($from .. $to) {
+		next if grep { $_ == $n } @missing;
+		snd($sock_a, $port_b, rtp(0, $n, 3000 + 160 * ($n - 1000), 0x2345679, "\x00" x 160));
+		Time::HiRes::usleep(2000);
+	}
+};
+
+# the second output is a subscriber behind a transcoder. It is blocked at first, so that it
+# starts counting only after the first output has already seen packets go missing.
+my ($ftr, $ttr, $port_c);
+($ftr, $ttr, undef, undef, undef, $port_c) = subscribe_request("loss counted once - $case",
+	{ 'from-tag' => ft(), codec => { transcode => ['PCMA'] } }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendonly
+a=rtcp:PORT
+SDP
+
+subscribe_answer("loss counted once - $case",
+	{ 'from-tag' => ft(), 'to-tag' => $ttr, flags => ['allow transcoding'] }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+t=0 0
+m=audio 3114 RTP/AVP 8
+c=IN IP4 198.51.100.43
+a=recvonly
+SDP
+
+rtpe_req('block media', "loss counted once - $case", { 'from-tag' => ft(), all => 'except-offer-answer', flags => ['directional'] });
+
+my $before = $intf_lost->();
+
+$send->(1000, 1040, 1010, 1020);
+
+rtpe_req('unblock media', "loss counted once - $case", { 'from-tag' => ft(), all => 'except-offer-answer', flags => ['directional'] });
+
+# (the last gap is far enough from the end to have left the 32-packet window)
+$send->(1041, 1120, 1050, 1060, 1070);
+
+is $intf_lost->() - $before, 5, "$case: each lost packet is counted once";
+
+rtpe_req('delete', "loss counted once - $case", { });
+
+}
+
+
 
 #done_testing;NGCP::Rtpengine::AutoTest::terminate('f00');exit;
 done_testing();

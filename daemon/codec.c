@@ -58,9 +58,13 @@ static void codec_store_add_raw_order(struct codec_store *cs, rtp_payload_type *
 static rtp_payload_type *codec_store_find_compatible(struct codec_store *cs,
 		const rtp_payload_type *pt);
 static void __rtp_payload_type_add_name(codec_names_ht, rtp_payload_type *pt);
-static uint32_t codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq);
+static uint32_t codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq, int64_t tv);
 static uint32_t __codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq);
 static void handler_track_blocked_loss(struct media_packet *mp);
+static void handler_loss_to_sequencer(struct media_packet *mp);
+
+// after this long without a packet, whoever counts the loss of a stream is taken to be gone
+#define LOSS_COUNTER_TAKEOVER_US 1000000LL
 static void __codec_options_set(call_t *call, rtp_payload_type *pt, str_case_value_ht codec_set);
 
 
@@ -782,6 +786,7 @@ static void __reset_sequencer(void *p, void *dummy) {
 	s->sequencers = NULL;
 	s->media_cache = NULL;
 	s->sequencer_cache = NULL;
+	s->lost_sequencer = NULL;
 }
 static bool __make_transcoder_full(struct codec_handler *handler, rtp_payload_type *dest,
 		GHashTable *output_transcoders, int dtmf_payload_type, bool pcm_dtmf_detect,
@@ -2194,7 +2199,7 @@ static bool handler_silence_block(struct codec_handler *h, struct media_packet *
 // we terminate ourselves (block-media plus play-media) is otherwise never measured at all.
 static void handler_measure_ingress(struct codec_handler *h, struct media_packet *mp) {
 	codec_calc_jitter(mp->ssrc_in, ntohl(mp->rtp->timestamp), h->source_pt.clock_rate, mp->tv);
-	uint32_t lost_diff = codec_calc_lost(mp->ssrc_in, ntohs(mp->rtp->seq_num));
+	uint32_t lost_diff = codec_calc_lost(mp->ssrc_in, ntohs(mp->rtp->seq_num), mp->tv);
 	if (lost_diff) {
 		if (mp->sfd && mp->sfd->local_intf && mp->sfd->local_intf->stats)
 			atomic64_add_na(&mp->sfd->local_intf->stats->s.packets_lost, lost_diff);
@@ -2303,7 +2308,7 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 	else
 		seq = g_hash_table_lookup(ssrc_in->sequencers, mp->media_out);
 	if (!seq) {
-		seq = g_new0(__typeof(*seq), 1);
+		seq = g_new0(__typeof(*seq), 1); // (lost_seen starts at zero with lost_count)
 		packet_sequencer_init(seq, (GDestroyNotify) __transcode_packet_free);
 		g_hash_table_insert(ssrc_in->sequencers, mp->media_out, seq);
 		ssrc_in->media_cache = mp->media_out;
@@ -2317,6 +2322,16 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 			ilog(LOG_DEBUG, "transcode: restoring sequencer, roc: %d ext_seq: %u seq: %u", seq->roc, seq->ext_seq, seq->seq);
 		}
 	}
+
+	// A stream that goes to several outputs through a transcoder has a sequencer for each,
+	// and each of them counts the same gaps: only one of them is counted. Another one takes
+	// over when that one has not been given a packet for a second (its output is gone or
+	// blocked).
+	if (ssrc_in->lost_sequencer != seq && (!ssrc_in->lost_sequencer
+				|| mp->tv - ssrc_in->lost_sequencer_tv > LOSS_COUNTER_TAKEOVER_US))
+		ssrc_in->lost_sequencer = seq;
+	if (ssrc_in->lost_sequencer == seq)
+		ssrc_in->lost_sequencer_tv = mp->tv;
 
 	uint16_t seq_ori = (seq->seq < 0) ? 0 : seq->seq;
 	int seq_ret = packet_sequencer_insert(seq, &packet->p);
@@ -2423,11 +2438,13 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 		// (media relayed as it is, or blocked): the sequencer then sees the events of the
 		// stream only and takes the audio in between for lost, which the tracker, seeing
 		// every packet, knows better. What was added to the SSRC's count by the tracker
-		// stays in it. (ssrc_in is locked here.)
-		uint32_t seq_new_lost = seq->lost_count > ssrc_in->seq_lost_seen
-			? seq->lost_count - ssrc_in->seq_lost_seen : 0;
-		ssrc_in->seq_lost_seen = seq->lost_count;
-		if (seq_new_lost && !ssrc_in->lost_tracker_current) {
+		// stays in it. Each sequencer remembers how far its own count was looked at, and
+		// of several sequencers of one stream only one is counted (see above).
+		// (ssrc_in is locked here.)
+		uint32_t seq_new_lost = seq->lost_count > seq->lost_seen
+			? seq->lost_count - seq->lost_seen : 0;
+		seq->lost_seen = seq->lost_count;
+		if (seq_new_lost && !ssrc_in->lost_tracker_current && ssrc_in->lost_sequencer == seq) {
 			ssrc_in->packets_lost += seq_new_lost;
 			if (mp->sfd && mp->sfd->local_intf && mp->sfd->local_intf->stats)
 				atomic64_add_na(&mp->sfd->local_intf->stats->s.packets_lost, seq_new_lost);
@@ -2890,8 +2907,7 @@ static int __handler_func_supplemental(struct codec_handler *h, struct media_pac
 	else if (mp->ssrc_in && !handler_media_blocked(mp)) {
 		// an event of a stream that is not blocked goes through the sequencer, which
 		// counts what is lost from here on: the gap tracker is not current any more
-		LOCK(&mp->ssrc_in->h.lock);
-		mp->ssrc_in->lost_tracker_current = false;
+		handler_loss_to_sequencer(mp);
 	}
 
 	return __handler_func_sequencer(mp, packet);
@@ -4993,6 +5009,13 @@ void codec_calc_jitter(struct ssrc_entry_call *ssrc, unsigned long ts, unsigned 
 	uint32_t transit = (uint32_t) ((uint64_t) (tv / 1000000) * clockrate
 			+ (uint64_t) (tv % 1000000) * clockrate / 1000000) - ts;
 	LOCK(&ssrc->h.lock);
+	// A packet that goes to several outputs comes here once for each of them: it is one
+	// sample. (Taken again it would count as a packet without any jitter, and the estimate
+	// would sink with the number of outputs.)
+	if (ssrc->jitter_tv == tv && ssrc->jitter_ts == (uint32_t) ts && ssrc->transit)
+		return;
+	ssrc->jitter_tv = tv;
+	ssrc->jitter_ts = ts;
 	int32_t d = 0;
 	if (ssrc->transit)
 		d = transit - ssrc->transit;
@@ -5003,9 +5026,10 @@ void codec_calc_jitter(struct ssrc_entry_call *ssrc, unsigned long ts, unsigned 
 	if (d < 100000)
 		ssrc->jitter += d - ((ssrc->jitter + 8) >> 4);
 }
-static uint32_t codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq) {
+static uint32_t codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq, int64_t tv) {
 	LOCK(&ssrc->h.lock);
 	ssrc->lost_tracker_current = true;
+	ssrc->lost_relay_tv = tv;
 	return __codec_calc_lost(ssrc, seq);
 }
 // ssrc is locked
@@ -5098,6 +5122,17 @@ static void handler_track_blocked_loss(struct media_packet *mp) {
 		atomic64_add_na(&mp->sfd->local_intf->stats->s.packets_lost, lost_diff);
 	RTPE_STATS_ADD(packets_lost, lost_diff);
 }
+// The stream goes into a transcoder, whose sequencer counts what is lost from here on --
+// unless the same stream is also relayed as it is to another output: the gap tracker then
+// sees every packet of it anyway and goes on counting, and the sequencer's count stays out,
+// or each gap would be counted by both.
+static void handler_loss_to_sequencer(struct media_packet *mp) {
+	struct ssrc_entry_call *ssrc = mp->ssrc_in;
+	LOCK(&ssrc->h.lock);
+	if (ssrc->lost_relay_tv && mp->tv - ssrc->lost_relay_tv <= LOSS_COUNTER_TAKEOVER_US)
+		return;
+	ssrc->lost_tracker_current = false;
+}
 static void handler_measure_blocked_transcode(struct codec_handler *h, struct media_packet *mp) {
 	struct codec_handler *ih = h->source_pt.codec_def->supplemental
 		? __input_handler(h, mp) : h;
@@ -5113,8 +5148,7 @@ static int handler_func_transcode(struct codec_handler *h, struct media_packet *
 	}
 	if (mp->ssrc_in && h->transcoder) {
 		// from here on the sequencer counts what is lost
-		LOCK(&mp->ssrc_in->h.lock);
-		mp->ssrc_in->lost_tracker_current = false;
+		handler_loss_to_sequencer(mp);
 	}
 
 	// use main codec handler for supp codecs
