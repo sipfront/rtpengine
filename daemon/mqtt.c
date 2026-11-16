@@ -305,6 +305,9 @@ static void mqtt_ssrc_stats(struct ssrc_entry_call *ssrc, JsonBuilder *json, str
 
 	mutex_lock(&ssrc->h.lock);
 	uint32_t jitter = ssrc->jitter;
+	// (the estimate is in units of the clock it was measured on)
+	if (ssrc->jitter_clockrate)
+		clockrate = ssrc->jitter_clockrate;
 	int64_t mos = -1, rtt = -1, rtt_leg = -1;
 	if (ssrc->stats_blocks.length) {
 		struct ssrc_stats_block *sb = ssrc->stats_blocks.tail->data;

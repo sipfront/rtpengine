@@ -109,6 +109,7 @@ struct ssrc_entry_call {
 	packet_sequencer_t *sequencer_cache; // to skip hash lookup
 	struct call_media *media_cache; // to skip hash lookup
 	uint32_t jitter, transit;
+	uint32_t jitter_clockrate; // the clock both of them are in: that of the codec last measured
 	// output only
 	uint16_t seq_diff;
 };
