@@ -65,6 +65,8 @@ static void handler_loss_to_sequencer(struct media_packet *mp);
 
 // after this long without a packet, whoever counts the loss of a stream is taken to be gone
 #define LOSS_COUNTER_TAKEOVER_US 1000000LL
+// the gap tracker counts a packet as lost when it is this many behind (the bits of lost_bits)
+#define LOSS_TRACKER_WINDOW 32
 static void __codec_options_set(call_t *call, rtp_payload_type *pt, str_case_value_ht codec_set);
 
 
@@ -2197,6 +2199,11 @@ static bool handler_silence_block(struct codec_handler *h, struct media_packet *
 // Measures what was received (jitter, sequence gaps) for a packet that is not transcoded.
 // Must run before the media-blocking check: blocked media is still received, and a stream
 // we terminate ourselves (block-media plus play-media) is otherwise never measured at all.
+// ssrc is locked: is the stream (still) relayed as it is to an output, so that the gap
+// tracker sees every packet of it?
+static bool handler_loss_relayed(struct ssrc_entry_call *ssrc, int64_t tv) {
+	return ssrc->lost_relay_tv && tv - ssrc->lost_relay_tv <= LOSS_COUNTER_TAKEOVER_US;
+}
 static void handler_measure_ingress(struct codec_handler *h, struct media_packet *mp) {
 	codec_calc_jitter(mp->ssrc_in, ntohl(mp->rtp->timestamp), h->source_pt.clock_rate, mp->tv);
 	uint32_t lost_diff = codec_calc_lost(mp->ssrc_in, ntohs(mp->rtp->seq_num), mp->tv);
@@ -2462,9 +2469,22 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 			? seq->lost_count - seq->lost_seen : 0;
 		if (!seq_new_lost)
 			seq->lost_seen = seq->lost_count;
-		else if (ssrc_in->lost_tracker_current || handler_media_blocked(mp)) {
+		else if (handler_media_blocked(mp)) {
 			// the gap tracker's to count
 			seq->lost_seen = seq->lost_count;
+		}
+		else if (ssrc_in->lost_tracker_current) {
+			// The gap tracker's to count as well. Where that is because the stream is also
+			// relayed as it is (and not because it was blocked), the tracker counts a gap
+			// only once it is a whole window behind, and it stops when that output goes
+			// away: what this sequencer has seen is kept until the tracker has counted
+			// as much (see codec_calc_lost), so that what the tracker had not got to yet
+			// is counted here when the sequencer takes over. Never more than the window
+			// holds: beyond that the tracker has made up its mind.
+			if (!handler_loss_relayed(ssrc_in, mp->tv))
+				seq->lost_seen = seq->lost_count;
+			else if (seq_new_lost > LOSS_TRACKER_WINDOW)
+				seq->lost_seen = seq->lost_count - LOSS_TRACKER_WINDOW;
 		}
 		else if (ssrc_in->lost_sequencer == seq) {
 			seq->lost_seen = seq->lost_count;
@@ -5059,7 +5079,20 @@ static uint32_t codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq, int6
 	LOCK(&ssrc->h.lock);
 	ssrc->lost_tracker_current = true;
 	ssrc->lost_relay_tv = tv;
-	return __codec_calc_lost(ssrc, seq);
+	uint32_t lost = __codec_calc_lost(ssrc, seq);
+	if (lost && ssrc->sequencers) {
+		// what is counted here is not left for a sequencer of the same stream to count
+		// later (see __handler_func_sequencer)
+		GHashTableIter iter;
+		gpointer value;
+		g_hash_table_iter_init(&iter, ssrc->sequencers);
+		while (g_hash_table_iter_next(&iter, NULL, &value)) {
+			packet_sequencer_t *ps = value;
+			unsigned int kept = ps->lost_count > ps->lost_seen ? ps->lost_count - ps->lost_seen : 0;
+			ps->lost_seen = kept > lost ? ps->lost_seen + lost : ps->lost_count;
+		}
+	}
+	return lost;
 }
 // ssrc is locked
 static uint32_t __codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq) {
@@ -5163,7 +5196,7 @@ static void handler_track_blocked_loss(struct media_packet *mp) {
 static void handler_loss_to_sequencer(struct media_packet *mp) {
 	struct ssrc_entry_call *ssrc = mp->ssrc_in;
 	LOCK(&ssrc->h.lock);
-	if (ssrc->lost_relay_tv && mp->tv - ssrc->lost_relay_tv <= LOSS_COUNTER_TAKEOVER_US)
+	if (handler_loss_relayed(ssrc, mp->tv))
 		return;
 	ssrc->lost_tracker_current = false;
 }

@@ -928,6 +928,114 @@ rtpe_req('delete', "loss counted once - $case", { });
 }
 
 
+# ... and when the output that is relayed as it is goes away while a transcoded one stays:
+# what the two had not counted yet between them is counted by the one that is left
+
+{
+
+($sock_a, $sock_b, $sock_c) =
+	new_call([qw(198.51.100.43 3120)], [qw(198.51.100.43 3122)], [qw(198.51.100.43 3124)]);
+
+($port_a) = offer('loss counted once - relayed one leaves', { codec => { transcode => ['PCMA'] } }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+c=IN IP4 198.51.100.43
+t=0 0
+m=audio 3120 RTP/AVP 0
+-----------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0 8
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+($port_b) = answer('loss counted once - relayed one leaves', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+c=IN IP4 198.51.100.43
+t=0 0
+m=audio 3122 RTP/AVP 8
+-----------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+my ($ftr, $ttr, $port_c);
+($ftr, $ttr, undef, undef, undef, $port_c) = subscribe_request('loss counted once - relayed one leaves',
+	{ 'from-tag' => ft() }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendonly
+a=rtcp:PORT
+SDP
+
+subscribe_answer('loss counted once - relayed one leaves',
+	{ 'from-tag' => ft(), 'to-tag' => $ttr }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.43
+s=tester
+t=0 0
+m=audio 3124 RTP/AVP 0
+c=IN IP4 198.51.100.43
+a=recvonly
+SDP
+
+my $intf_lost = sub {
+	my $r = rtpe_req('statistics', 'loss counted once - relayed one leaves stats', { });
+	my ($intf) = grep { $_->{address} eq '203.0.113.1' } @{$r->{statistics}{interfaces}};
+	return $intf->{ingress}{packets_lost};
+};
+my $send = sub {
+	my ($from, $to, @missing) = @_;
+	for my $n ($from .. $to) {
+		next if grep { $_ == $n } @missing;
+		snd($sock_a, $port_b, rtp(0, $n, 3000 + 160 * ($n - 1000), 0x234567a, "\x00" x 160));
+		Time::HiRes::usleep(2000);
+	}
+};
+
+my $before = $intf_lost->();
+
+# one packet missing early enough to have been counted while both outputs are there, one
+# so late that it has not been yet
+$send->(1000, 1080, 1010, 1070);
+is $intf_lost->() - $before, 1, 'relayed one leaves: counted so far';
+
+rtpe_req('unsubscribe', 'loss counted once - relayed one leaves', { 'from-tag' => ft(), 'to-tag' => $ttr });
+
+# and one right after it has left
+$send->(1081, 1110, 1090);
+# (the output that is left takes over once nothing has been relayed for a second)
+Time::HiRes::sleep(1.2);
+$send->(1111, 1120);
+
+is $intf_lost->() - $before, 3, 'relayed one leaves: each lost packet is counted once';
+
+rtpe_req('delete', 'loss counted once - relayed one leaves', { });
+
+}
+
+
 
 #done_testing;NGCP::Rtpengine::AutoTest::terminate('f00');exit;
 done_testing();
