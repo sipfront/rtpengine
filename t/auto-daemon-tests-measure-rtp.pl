@@ -1064,16 +1064,18 @@ o=- 1545997027 1 IN IP4 198.51.100.43
 s=tester
 c=IN IP4 198.51.100.43
 t=0 0
-m=audio 3130 RTP/AVP 0 101
+m=audio 3130 RTP/AVP 0 96 101
+a=rtpmap:96 opus/48000/2
 a=rtpmap:101 telephone-event/8000
 -----------------------------------------
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.43
 s=tester
 t=0 0
-m=audio PORT RTP/AVP 0 101
+m=audio PORT RTP/AVP 0 96 101
 c=IN IP4 203.0.113.1
 a=rtpmap:0 PCMU/8000
+a=rtpmap:96 opus/48000/2
 a=rtpmap:101 telephone-event/8000
 a=sendrecv
 a=rtcp:PORT
@@ -1085,16 +1087,18 @@ o=- 1545997027 1 IN IP4 198.51.100.43
 s=tester
 c=IN IP4 198.51.100.43
 t=0 0
-m=audio 3132 RTP/AVP 0 101
+m=audio 3132 RTP/AVP 0 96 101
+a=rtpmap:96 opus/48000/2
 a=rtpmap:101 telephone-event/8000
 -----------------------------------------
 v=0
 o=- 1545997027 1 IN IP4 198.51.100.43
 s=tester
 t=0 0
-m=audio PORT RTP/AVP 0 101
+m=audio PORT RTP/AVP 0 96 101
 c=IN IP4 203.0.113.1
 a=rtpmap:0 PCMU/8000
+a=rtpmap:96 opus/48000/2
 a=rtpmap:101 telephone-event/8000
 a=sendrecv
 a=rtcp:PORT
@@ -1106,16 +1110,18 @@ SDP
 
 	my %c;
 	my ($seq, $ts, $last) = (1000, 3000, Time::HiRes::time());
-	# One packet now. Its timestamp is that many packets of 20 ms after the one before
-	# (none: the same timestamp again), or 'now': as much later as it really is since the
-	# timestamp last moved on.
+	# One packet now: PCMU (0), Opus (96, on a clock of 48 kHz) or a telephone event (101).
+	# Its timestamp is that many packets of 20 ms after the one before (none: the same
+	# timestamp again), or 'now': as much later as it really is since the timestamp last
+	# moved on.
 	$c{snd} = sub {
 		my ($pt, $payload, $steps) = @_;
 		$steps //= 1;
+		my $clock = $pt == 96 ? 48000 : 8000;
 		my $now = Time::HiRes::time();
-		$ts += $steps eq 'now' ? int(($now - $last) * 8000) : 160 * $steps;
+		$ts += $steps eq 'now' ? int(($now - $last) * $clock) : $clock / 50 * $steps;
 		$last = $now if $steps; # (when the timestamp last moved on)
-		snd($s_a, $p_b, rtp($pt, $seq++, $ts, 0x234567b, $payload));
+		snd($s_a, $p_b, rtp($pt, $seq++, $ts & 0xffffffff, 0x234567b, $payload));
 	};
 	# what the samples taken over the next good second average to, in ms
 	# (they are taken by the once-per-second call timer)
@@ -1136,8 +1142,9 @@ SDP
 	};
 	# a second of packets 10 and 30 ms apart in turn: 10 ms of jitter on each
 	$c{jittery} = sub {
+		my ($pt) = @_;
 		for my $i (1 .. 50) {
-			$c{snd}->(0, "\x00" x 160);
+			$c{snd}->($pt // 0, "\x00" x 160);
 			Time::HiRes::usleep($i % 2 ? 10000 : 30000);
 		}
 	};
@@ -1151,7 +1158,7 @@ SDP
 # samples like any other: with them the estimate comes down, as nothing about them jitters
 jitter_case('packets with one timestamp', sub {
 	my ($c) = @_;
-	my $j = $c->{sampled}->($c->{jittery});
+	my $j = $c->{sampled}->(sub { $c->{jittery}->() });
 	cmp_ok $j, '>=', 5, 'jitter - packets with one timestamp: there is jitter before them';
 	diag("jitter before the packets with one timestamp: $j ms");
 	$j = $c->{sampled}->(sub {
@@ -1166,12 +1173,14 @@ jitter_case('packets with one timestamp', sub {
 	diag("jitter after 80 packets with one timestamp: $j ms");
 });
 
-# the packets of a telephone event repeat one timestamp while time goes on: that is no jitter
+# The packets of a telephone event repeat one timestamp while time goes on: that is no jitter.
+# And the event has a clock of its own (8 kHz here, next to audio of 48 kHz): an event long
+# enough to be all that was received lately does not make the audio's jitter be read on it.
 jitter_case('a telephone event', sub {
 	my ($c) = @_;
 	my $j = $c->{sampled}->(sub {
 		for (1 .. 50) {
-			$c->{snd}->(0, "\x00" x 160);
+			$c->{snd}->(96, "\x00" x 80);
 			Time::HiRes::usleep(20000);
 		}
 	});
@@ -1179,21 +1188,34 @@ jitter_case('a telephone event', sub {
 	cmp_ok $j, '<=', 6, 'jitter - a telephone event: a steady stream has little';
 	diag("jitter of a steady stream: $j ms");
 	$j = $c->{sampled}->(sub {
-		$c->{snd}->(0, "\x00" x 160, 'now');
+		$c->{snd}->(96, "\x00" x 80, 'now');
 		Time::HiRes::usleep(20000);
 		$c->{snd}->(101, "\x05\x0a\x00\xa0");
-		for my $i (2 .. 25) {
+		for my $i (2 .. 45) {
 			Time::HiRes::usleep(20000);
 			$c->{snd}->(101, "\x05\x0a" . pack('n', 160 * $i), 0);
 		}
-		for my $i (1 .. 3) {
-			Time::HiRes::usleep(20000);
-			$c->{snd}->(0, "\x00" x 160, $i == 1 ? 'now' : 1);
-		}
 	});
-	# (25 packets taken as 20 ms late each would be some 15 ms of it)
-	cmp_ok $j, '<=', 6, 'jitter - a telephone event: and no more with an event in it';
+	# (45 packets taken as 20 ms late each would be some 18 ms of it, and the audio's
+	# estimate read on the event's clock six times what it is)
+	cmp_ok $j, '<=', 6, 'jitter - a telephone event: and no more with a long event in it';
 	diag("jitter of a steady stream with a telephone event: $j ms");
+});
+
+# the stream goes on with a codec of another clock: the estimate goes on with it
+jitter_case('another clock', sub {
+	my ($c) = @_;
+	my $j = $c->{sampled}->(sub { $c->{jittery}->(0) });
+	cmp_ok $j, '>=', 5, 'jitter - another clock: there is jitter at 8 kHz';
+	diag("jitter at 8 kHz: $j ms");
+	$j = $c->{sampled}->(sub {
+		$c->{snd}->(96, "\x00" x 80, 'now');
+		Time::HiRes::usleep(20000);
+		$c->{jittery}->(96);
+	});
+	cmp_ok $j, '>=', 5, 'jitter - another clock: and the same at 48 kHz';
+	cmp_ok $j, '<=', 15, 'jitter - another clock: no more and no less';
+	diag("jitter at 48 kHz: $j ms");
 });
 
 

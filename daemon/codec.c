@@ -4947,6 +4947,16 @@ void codec_calc_jitter(struct ssrc_entry_call *ssrc, unsigned long ts, unsigned 
 	uint32_t transit = (uint32_t) ((uint64_t) (tv / 1000000) * clockrate
 			+ (uint64_t) (tv % 1000000) * clockrate / 1000000) - ts;
 	LOCK(&ssrc->h.lock);
+	if (G_UNLIKELY(ssrc->jitter_clockrate != clockrate)) {
+		// The estimate is kept in units of the clock it is measured on, and that clock
+		// is kept with it for whoever reads it. When the stream goes on with a codec
+		// of another clock, the estimate is carried over into the new units, and this
+		// packet has nothing before it to be compared with.
+		if (ssrc->jitter_clockrate)
+			ssrc->jitter = (uint64_t) ssrc->jitter * clockrate / ssrc->jitter_clockrate;
+		ssrc->jitter_clockrate = clockrate;
+		ssrc->transit = 0;
+	}
 	int32_t d = 0;
 	if (ssrc->transit)
 		d = transit - ssrc->transit;
