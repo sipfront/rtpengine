@@ -2972,6 +2972,10 @@ static int stream_packet(struct packet_handler_ctx *phc) {
 		}
 	}
 
+	// What is received is measured here, once per packet and before any of the outputs
+	// gets it: loss and jitter do not depend on where the packet goes from here.
+	codec_measure_ingress(&phc->mp, phc->payload_type);
+
 	// If recording pcap dumper is set, then we record the call.
 	if (phc->mp.call->recording && !rtpe_config.rec_egress)
 		dump_packet(&phc->mp, &phc->s);
